@@ -1342,7 +1342,17 @@ namespace FLPlayer {
             }
             if (now - lastProbeAt >= 2000) {
                 lastProbeAt = now;
-                console.write("\x1b7\x1b[999;999H\x1b[6n\x1b8");
+                // In-process, the terminal layer CONSUMES raw CPR replies (they
+                // feed the engine's own cursor machinery and never reach
+                // inkey) — so raw \x1b[6n probes are invisible to us. Ask the
+                // engine instead: getdimensions() runs ITS remote size query
+                // and refreshes console.screen_columns/rows, which the watcher
+                // above relayouts from on the next iteration. (Native doors
+                // like spekder/lameboy read the socket directly, which is why
+                // the raw-probe pattern works there but not here.)
+                try {
+                    console.getdimensions();
+                } catch (probeErr) { }
             }
 
             // Natural end fallback (in case the drain notify was lost).
