@@ -1034,9 +1034,31 @@ namespace FLPlayer {
         var borderPulse = 0;          // decaying beat flash
         var lastRms = 0;
         var artFlashAt = 0;
-        // Beat-stepped palette sequence: every other step returns to the true
-        // palette so the art keeps reading as itself between swaps.
-        var PALETTE_SEQ = [0, 1, 0, 3, 0, 2, 0, 4];
+        // Beat-stepped palette sequences: every other step returns to the
+        // true palette so the art keeps reading as itself between swaps.
+        // Colorful art cycles the structure-preserving maps; grayscale-heavy
+        // art (where those maps are invisible no-ops) gets the colorizers
+        // that wash the grays — amber/ice/neon plus a negative flash.
+        var SEQ_COLORFUL = [0, 1, 0, 3, 0, 5, 0, 2, 0, 7, 0, 4, 0, 6];
+        var SEQ_GRAYSCALE = [0, 5, 0, 6, 0, 7, 0, 5, 0, 6, 0, 8];
+        var PALETTE_SEQ = SEQ_COLORFUL;
+        if (blit.grid) {
+            var chroma = 0;
+            var cells = 0;
+            for (var gy = 0; gy < blit.grid.rows.length; gy++) {
+                var grow = blit.grid.rows[gy];
+                for (var gx = 0; gx < grow.length; gx++) {
+                    var at = grow[gx] >> 8;
+                    var fgIdx = at & 0x07;
+                    var bgIdx = (at >> 4) & 0x07;
+                    cells++;
+                    if ((fgIdx >= 1 && fgIdx <= 6) || (bgIdx >= 1 && bgIdx <= 6))
+                        chroma++;
+                }
+            }
+            if (cells > 0 && chroma / cells < 0.15)
+                PALETTE_SEQ = SEQ_GRAYSCALE;
+        }
         var palStep = 0;
         var margins: Rect[] = [];
         var checkerPhase = 0;

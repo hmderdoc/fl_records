@@ -36,7 +36,13 @@ namespace FLAnsiGrid {
         [0, 5, 3, 1, 6, 4, 2, 7],   // 1 hue rotate
         [0, 4, 1, 5, 2, 6, 3, 7],   // 2 hue rotate, second step
         [0, 6, 5, 4, 3, 2, 1, 7],   // 3 complement (cool<->warm)
-        [0, 3, 6, 2, 5, 1, 4, 7]    // 4 scramble (high contrast)
+        [0, 3, 6, 2, 5, 1, 4, 7],   // 4 scramble (high contrast)
+        // Colorizers: these MOVE the grays (7, and 8 even black), so
+        // grayscale-heavy art gets washed in color instead of sitting still.
+        [0, 1, 2, 3, 4, 5, 7, 6],   // 5 amber: white <-> brown (bright = gold)
+        [0, 1, 2, 7, 4, 5, 6, 3],   // 6 ice: white <-> cyan
+        [0, 1, 2, 3, 4, 7, 6, 5],   // 7 neon: white <-> magenta
+        [7, 1, 2, 3, 4, 5, 6, 0]    // 8 negative: black <-> white flash
     ];
 
     /** Remove a trailing SAUCE record (and the EOF marker it follows). */
