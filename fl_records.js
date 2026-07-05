@@ -1325,7 +1325,7 @@ var FLPlayer;
     function chunkFeatures(slice, channels) {
         var frames = Math.floor(slice.length / (channels * 2));
         if (frames < 2)
-            return { rms: 0, zcr: 0 };
+            return { rms: 0, raw: 0, zcr: 0 };
         // RMS (loudness): strided samples across the whole chunk.
         var points = 256;
         var step = Math.max(1, Math.floor(frames / points));
@@ -1339,10 +1339,12 @@ var FLPlayer;
             count++;
         }
         if (!count)
-            return { rms: 0, zcr: 0 };
-        var rms = Math.sqrt(sumSq / count) / 32768;
-        // Perceptual-ish lift: quiet music still moves the meter.
-        rms = Math.sqrt(clamp(rms * 3.2, 0, 1));
+            return { rms: 0, raw: 0, zcr: 0 };
+        var raw = Math.sqrt(sumSq / count) / 32768;
+        // Perceptual-ish lift for METERS only: quiet music still moves them.
+        // Beat/onset detection uses `raw` — the lift compresses loud passages
+        // so hard that deltas vanish and beats never fire on hot mixes.
+        var rms = Math.sqrt(clamp(raw * 3.2, 0, 1));
         // ZCR (brightness): must be measured over CONTIGUOUS samples — strided
         // points ~26ms apart are decorrelated and always read ~50% flips.
         var winFrames = Math.min(frames, 512);
@@ -1359,7 +1361,7 @@ var FLPlayer;
         }
         // crossings/frame *at the PCM rate*: ~0.02 = bassy, ~0.25+ = bright.
         var zcr = clamp((crossings / winFrames) * 5, 0, 1);
-        return { rms: rms, zcr: zcr };
+        return { rms: rms, raw: raw, zcr: zcr };
     }
     FLPlayer.chunkFeatures = chunkFeatures;
     // ---- synced lyrics -------------------------------------------------------
@@ -1535,7 +1537,8 @@ var FLPlayer;
     // Audio-reactive glow strips flanking the lyric line: reach follows
     // loudness, color follows brightness (ZCR): bass reads red/magenta,
     // bright reads cyan/white.
-    var VIS_MODES = ["glow", "glow+art", "border", "off"];
+    // Art palette swaps are part of the default look; [V] steps away from it.
+    var VIS_MODES = ["glow+art", "glow", "border", "off"];
     function drawGlow(l, row, rms, zcr, on) {
         if (!on) {
             console.write(CLR + gotoRC(row, l.boxLeft) + repeatByte(" ", l.boxWidth));
@@ -1864,6 +1867,17 @@ var FLPlayer;
         var rings = [];
         var fieldTick = 0; // field effects repaint on alternate ticks
         var lastProbeAt = 0;
+        // Onset + energy tracking (all on RAW rms, updated once per chunk):
+        // emaFast (~1s) is the local level — a chunk jumping clearly above it
+        // is a beat/accent, even mid-plateau. emaSlow (~6s) is the passage
+        // energy — fast diverging from slow marks quiet<->loud transitions,
+        // which drive the auto background rotation.
+        var emaFast = -1;
+        var emaSlow = -1;
+        var lastFeatChunk = -1;
+        var autoIdx = 0; // auto rotation: checker -> plasma -> ripple
+        var AUTO_EFFECTS = ["checker", "plasma", "ripple"];
+        var lastAutoSwitchAt = nowMs();
         var blit = makeArtBlit(track, l);
         var sprites = makeSprites(track, l);
         margins = marginRects(l, blit);
@@ -1915,7 +1929,7 @@ var FLPlayer;
         var lastFlushAt = nowMs();
         var lastUiAt = 0;
         var result = "ended";
-        var features = { rms: 0, zcr: 0 };
+        var features = { rms: 0, raw: 0, zcr: 0 };
         var featForChunk = [];
         function emitChunk(idx) {
             f.position = info.dataOffset + idx * chunkBytes;
@@ -2070,10 +2084,38 @@ var FLPlayer;
                 if (fi)
                     features = fi;
                 var mode = VIS_MODES[visMode];
-                var beat = !paused && features.rms > lastRms + 0.22;
+                var beat = false;
+                var hardBeat = false;
+                if (!paused && playChunk !== lastFeatChunk && features.raw > 0) {
+                    lastFeatChunk = playChunk;
+                    if (emaFast < 0) {
+                        emaFast = features.raw;
+                        emaSlow = features.raw;
+                    }
+                    beat = features.raw > emaFast * 1.25 + 0.015;
+                    hardBeat = features.raw > emaFast * 1.55 + 0.03;
+                    emaFast = emaFast * 0.7 + features.raw * 0.3;
+                    emaSlow = emaSlow * 0.95 + features.raw * 0.05;
+                }
                 if (beat)
                     borderPulse = 3;
                 lastRms = features.rms;
+                // Auto background rotation on musical transitions: the local
+                // level diverging from the passage energy (quiet->loud or
+                // loud->quiet) advances the effect, with a 30s variety
+                // fallback so long steady passages still evolve. The switch
+                // announces itself with a strobe flash.
+                if (BG_MODES[bgMode] === "auto" && !paused && emaSlow > 0) {
+                    var swAge = now - lastAutoSwitchAt;
+                    var ratio = (emaFast - emaSlow) / Math.max(emaSlow, 0.01);
+                    if ((swAge > 8000 && (ratio > 0.4 || ratio < -0.3)) || swAge > 30000) {
+                        lastAutoSwitchAt = now;
+                        autoIdx = (autoIdx + 1) % AUTO_EFFECTS.length;
+                        rings = [];
+                        checkerDirty = true;
+                        strobeLevel = 3;
+                    }
+                }
                 // Art color-pulse: on beats, step the palette sequence (a
                 // set of distinct permutation maps that keeps returning to the
                 // true palette; rate-capped so slow links keep breathing room).
@@ -2090,10 +2132,11 @@ var FLPlayer;
                 // beats; ripples SPAWN on beats and expand with loudness;
                 // hard beats fire a strobe that decays over following frames.
                 var bg = BG_MODES[bgMode];
-                if (margins.length && bg !== "off" && !paused) {
+                if (bg === "auto")
+                    bg = AUTO_EFFECTS[autoIdx]; // rotated by the music above
+                if (margins.length && BG_MODES[bgMode] !== "off" && !paused) {
                     fieldTick++;
-                    var hardBeat = features.rms > lastRms + 0.3 || (beat && features.rms > 0.75);
-                    if ((bg === "auto" || bg === "strobe") && hardBeat)
+                    if ((BG_MODES[bgMode] === "auto" || BG_MODES[bgMode] === "strobe") && hardBeat)
                         strobeLevel = 3;
                     if (strobeLevel > 0) {
                         drawStrobe(margins, strobeLevel, features.zcr);
@@ -2101,7 +2144,7 @@ var FLPlayer;
                         if (strobeLevel === 0)
                             checkerDirty = true; // repaint pattern after decay
                     }
-                    else if (bg === "auto" || bg === "checker") {
+                    else if (bg === "checker") {
                         if (beat) {
                             checkerPhase++;
                             checkerDirty = true;
@@ -2211,8 +2254,10 @@ var FLPlayer;
         if (!(loud.zcr > 0))
             throw new Error("sine zcr zero");
         var quiet = chunkFeatures(repeatByte("\x00", 4000), 2);
-        if (quiet.rms !== 0)
+        if (quiet.rms !== 0 || quiet.raw !== 0)
             throw new Error("silence rms nonzero");
+        if (!(loud.raw > 0.15))
+            throw new Error("sine raw rms too low: " + loud.raw);
         // ANSI grid: SAUCE strip, wrap-at-width, SGR attrs, cursor-forward.
         var sauced = "hello" + "\x1a" + repeatByte("\x00", 100) +
             "SAUCE00" + repeatByte("z", 121);
