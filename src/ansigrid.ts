@@ -28,8 +28,16 @@ namespace FLAnsiGrid {
     var CGA_TO_SGR = [30, 34, 32, 36, 31, 35, 33, 37];
     // SGR 30-37 parameter -> CGA index.
     var SGR_TO_CGA = [0, 4, 2, 6, 1, 5, 3, 7];
-    // One step of chromatic hue rotation over CGA indexes 1..6 (0/7 stay).
-    var HUE_NEXT = [0, 5, 3, 1, 6, 4, 2, 7];
+    // Palette maps: permutations of the CGA indices. Structure-preserving
+    // (multicolor art stays multicolor — unlike a single-color strobe), with
+    // black/white anchored so silhouettes and highlights survive the swap.
+    export var PALETTES: number[][] = [
+        [0, 1, 2, 3, 4, 5, 6, 7],   // 0 identity (the real art)
+        [0, 5, 3, 1, 6, 4, 2, 7],   // 1 hue rotate
+        [0, 4, 1, 5, 2, 6, 3, 7],   // 2 hue rotate, second step
+        [0, 6, 5, 4, 3, 2, 1, 7],   // 3 complement (cool<->warm)
+        [0, 3, 6, 2, 5, 1, 4, 7]    // 4 scramble (high contrast)
+    ];
 
     /** Remove a trailing SAUCE record (and the EOF marker it follows). */
     export function stripSauce(art: string): string {
@@ -182,15 +190,10 @@ namespace FLAnsiGrid {
         return grid;
     }
 
-    function rotateCga(idx: number, steps: number): number {
-        for (var s = 0; s < steps; s++)
-            idx = HUE_NEXT[idx];
-        return idx;
-    }
-
-    export function attrToSgr(attr: number, hueShift: number): string {
-        var fg = rotateCga(attr & 0x07, hueShift);
-        var bg = rotateCga((attr >> 4) & 0x07, hueShift);
+    export function attrToSgr(attr: number, palIdx: number): string {
+        var pal = PALETTES[palIdx >= 0 && palIdx < PALETTES.length ? palIdx : 0];
+        var fg = pal[attr & 0x07];
+        var bg = pal[(attr >> 4) & 0x07];
         var out = "0";
         if (attr & 0x08) out += ";1";
         if (attr & 0x80) out += ";5";
@@ -201,11 +204,11 @@ namespace FLAnsiGrid {
     /**
      * Blit a window of the grid to the screen: source rows [srcRow, srcRow+nRows)
      * and cols [srcCol, srcCol+nCols) drawn with the top-left at screen
-     * (top,left) (1-based). Emits minimal SGR runs; hueShift rotates colors.
+     * (top,left) (1-based). Emits minimal SGR runs; palIdx remaps colors.
      */
     export function emit(grid: Grid, left: number, top: number,
         srcRow: number, nRows: number, srcCol: number, nCols: number,
-        hueShift: number): string {
+        palIdx: number): string {
         var out = "";
         var lastSgr = "";
         for (var r = 0; r < nRows; r++) {
@@ -217,7 +220,7 @@ namespace FLAnsiGrid {
             for (var cIdx = 0; cIdx < nCols; cIdx++) {
                 var gx = srcCol + cIdx;
                 var cell = gx >= 0 && gx < row.length ? row[gx] : ((DEFAULT_ATTR << 8) | 0x20);
-                var code = attrToSgr(cell >> 8, hueShift);
+                var code = attrToSgr(cell >> 8, palIdx);
                 if (code !== lastSgr) {
                     out += "\x1b[" + code + "m";
                     lastSgr = code;
