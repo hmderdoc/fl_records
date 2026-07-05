@@ -1551,7 +1551,8 @@ var FLPlayer;
     var VIS_MODES = ["glow+art", "glow", "border", "off"];
     function drawGlow(l, row, rms, zcr, on) {
         if (!on) {
-            console.write(CLR + gotoRC(row, l.boxLeft) + repeatByte(" ", l.boxWidth));
+            // Vis off: the row belongs to the background effect (or blank).
+            console.write(gotoRC(row, l.boxLeft) + bgFillRun(l.boxLeft, row, l.boxWidth));
             return;
         }
         var half = Math.floor(l.boxWidth / 2);
@@ -1568,8 +1569,13 @@ var FLPlayer;
             }
         }
         var left = line.split("").reverse().join("");
-        var strip = left + line + (l.boxWidth % 2 ? " " : "");
-        console.write(gotoRC(row, l.boxLeft) + sgr(color) + strip.substr(0, l.boxWidth) + CLR);
+        var half2 = l.boxWidth - half * 2;
+        // Glow chars in the center; whatever it doesn't reach shows the
+        // background effect instead of a black cutout.
+        var gap = half - reach;
+        console.write(gotoRC(row, l.boxLeft) + bgFillRun(l.boxLeft, row, gap) +
+            sgr(color) + left.substr(gap) + line.substr(0, reach) + CLR +
+            bgFillRun(l.boxLeft + half + reach, row, gap + half2));
     }
     // Each lyric line gets a random color pair (base, light) and sweeps in
     // with a moving wave: cells near the crest render white -> light -> base,
@@ -1585,7 +1591,7 @@ var FLPlayer;
         var pad = l.boxWidth - t.length;
         var lead = Math.floor(pad / 2);
         var pair = LYRIC_COLORS[colorIdx % LYRIC_COLORS.length];
-        var out = gotoRC(l.lyricRow, l.boxLeft) + CLR + repeatByte(" ", lead);
+        var out = gotoRC(l.lyricRow, l.boxLeft) + bgFillRun(l.boxLeft, l.lyricRow, lead);
         if (progress >= 1 || !t.length) {
             out += sgr(pair[1]) + t;
         }
@@ -1604,7 +1610,8 @@ var FLPlayer;
                 out += t.charAt(i);
             }
         }
-        console.write(out + CLR + repeatByte(" ", pad - lead));
+        console.write(out + CLR +
+            bgFillRun(l.boxLeft + lead + t.length, l.lyricRow, pad - lead));
     }
     // ---- background effects in the art margins --------------------------------
     // Whatever art-zone area the (centered) art does not cover gets a music-
@@ -1635,18 +1642,40 @@ var FLPlayer;
             if (artR < l.cols)
                 rects.push({ x: artR + 1, y: artT, w: l.cols - artR, h: artB - artT + 1 });
         }
-        // Bottom zone: effects run BEHIND the metadata rows too — the columns
-        // flanking the box span, from the glow strips down to the hints row.
-        // The lyric/glow/box/hints content lives inside the box span and
-        // repaints itself, so the flanks never touch it.
-        var flankTop = l.glowRow1;
-        var flankH = Math.min(l.rows, l.boxTop + 4) - flankTop + 1;
+        // Bottom zone: effects run BEHIND the status content. The glow/lyric
+        // rows and the hints row are painted full-width (their renderers fill
+        // gaps with the effect pattern, so text rides on top); only the box
+        // itself stays opaque, so just its flanking columns are painted.
+        rects.push({ x: 1, y: l.glowRow1, w: l.cols, h: 3 });
+        var boxH = 4;
         if (l.boxLeft > 1)
-            rects.push({ x: 1, y: flankTop, w: l.boxLeft - 1, h: flankH });
+            rects.push({ x: 1, y: l.boxTop, w: l.boxLeft - 1, h: boxH });
         var boxR = l.boxLeft + l.boxWidth;
         if (boxR <= l.cols)
-            rects.push({ x: boxR, y: flankTop, w: l.cols - boxR + 1, h: flankH });
+            rects.push({ x: boxR, y: l.boxTop, w: l.cols - boxR + 1, h: boxH });
+        var hintsRow = Math.min(l.rows, l.boxTop + 4);
+        if (hintsRow > l.boxTop + 3)
+            rects.push({ x: 1, y: hintsRow, w: l.cols, h: 1 });
         return rects;
+    }
+    // The active background effect's cell sampler: returns [sgrCode, char]
+    // for a screen cell, or null for empty. Text renderers in the bottom zone
+    // use it to fill their padding, so the pattern shows BEHIND the text.
+    var bgCellFn = null;
+    function bgFillRun(x, y, count) {
+        var out = "";
+        var last = "@";
+        for (var i = 0; i < count; i++) {
+            var cell = bgCellFn ? bgCellFn(x + i, y) : null;
+            var code = cell ? cell[0] : "0";
+            var ch = cell ? cell[1] : " ";
+            if (code !== last) {
+                out += sgr(code);
+                last = code;
+            }
+            out += ch;
+        }
+        return out + CLR;
     }
     function glowColor(zcr) {
         return zcr > 0.66 ? "1;37" : zcr > 0.45 ? "1;36" : zcr > 0.28 ? "0;36"
@@ -1655,7 +1684,11 @@ var FLPlayer;
     /** Checkerboard: 3-col blocks alternating shade/space; one SGR per row. */
     function drawChecker(rects, phase, rms, zcr) {
         var shade = rms > 0.7 ? "\xB2" : rms > 0.4 ? "\xB1" : "\xB0";
-        var out = sgr(glowColor(zcr));
+        var cc = glowColor(zcr);
+        bgCellFn = function (x, y) {
+            return ((Math.floor((x - 1) / 3) + y + phase) % 2 === 0) ? [cc, shade] : null;
+        };
+        var out = sgr(cc);
         for (var r = 0; r < rects.length; r++) {
             var rc = rects[r];
             for (var row = 0; row < rc.h; row++) {
@@ -1678,6 +1711,11 @@ var FLPlayer;
     /** Paint every cell of the margin rects from a value field (0..1). */
     function fieldPaint(rects, zcr, valueAt) {
         var colors = zcr > 0.4 ? FIELD_COOL : FIELD_WARM;
+        bgCellFn = function (x, y) {
+            var vv = valueAt(x, y);
+            var b = Math.floor(clamp(vv, 0, 0.999) * FIELD_CHARS.length);
+            return b > 0 ? [colors[b], FIELD_CHARS[b]] : null;
+        };
         var out = "";
         var lastBand = -1;
         for (var r = 0; r < rects.length; r++) {
@@ -1726,7 +1764,11 @@ var FLPlayer;
     /** Strobe frame at decay level 3..1 (3 = brightest); 0 clears. */
     function drawStrobe(rects, level, zcr) {
         var ch = level >= 3 ? "\xB2" : level === 2 ? "\xB1" : level === 1 ? "\xB0" : " ";
-        var out = level > 0 ? sgr(glowColor(zcr)) : CLR;
+        var sc = glowColor(zcr);
+        bgCellFn = level > 0
+            ? function (x, y) { return [sc, ch]; }
+            : null;
+        var out = level > 0 ? sgr(sc) : CLR;
         for (var r = 0; r < rects.length; r++) {
             var rc = rects[r];
             var line = repeatByte(ch, rc.w);
@@ -1927,31 +1969,7 @@ var FLPlayer;
         var borderPulse = 0; // decaying beat flash
         var lastRms = 0;
         var artFlashAt = 0;
-        // Beat-stepped palette sequences: every other step returns to the
-        // true palette so the art keeps reading as itself between swaps.
-        // Colorful art cycles the structure-preserving maps; grayscale-heavy
-        // art (where those maps are invisible no-ops) gets the colorizers
-        // that wash the grays — amber/ice/neon plus a negative flash.
-        var SEQ_COLORFUL = [0, 1, 0, 3, 0, 5, 0, 2, 0, 9, 0, 7, 0, 4, 0, 6];
-        var SEQ_GRAYSCALE = [0, 5, 0, 9, 0, 6, 0, 10, 0, 7, 0, 11, 0, 8];
-        var PALETTE_SEQ = SEQ_COLORFUL;
-        if (blit.grid) {
-            var chroma = 0;
-            var cells = 0;
-            for (var gy = 0; gy < blit.grid.rows.length; gy++) {
-                var grow = blit.grid.rows[gy];
-                for (var gx = 0; gx < grow.length; gx++) {
-                    var at = grow[gx] >> 8;
-                    var fgIdx = at & 0x07;
-                    var bgIdx = (at >> 4) & 0x07;
-                    cells++;
-                    if ((fgIdx >= 1 && fgIdx <= 6) || (bgIdx >= 1 && bgIdx <= 6))
-                        chroma++;
-                }
-            }
-            if (cells > 0 && chroma / cells < 0.15)
-                PALETTE_SEQ = SEQ_GRAYSCALE;
-        }
+        var PALETTE_SEQ = []; // chosen once the art grid exists
         var palStep = 0;
         var margins = [];
         var checkerPhase = 0;
@@ -1975,6 +1993,31 @@ var FLPlayer;
         var blit = makeArtBlit(track, l);
         var sprites = makeSprites(track, l);
         margins = marginRects(l, blit);
+        // Beat-stepped palette sequences: every other step returns to the
+        // true palette so the art keeps reading as itself between swaps.
+        // Colorful art cycles the structure-preserving maps; grayscale-heavy
+        // art (where those maps are invisible no-ops) gets the colorizers
+        // and black-movers that wash the whole canvas.
+        var SEQ_COLORFUL = [0, 1, 0, 3, 0, 5, 0, 2, 0, 9, 0, 7, 0, 4, 0, 6];
+        var SEQ_GRAYSCALE = [0, 5, 0, 9, 0, 6, 0, 10, 0, 7, 0, 11, 0, 8];
+        PALETTE_SEQ = SEQ_COLORFUL;
+        if (blit.grid) {
+            var chroma = 0;
+            var cells = 0;
+            for (var gy = 0; gy < blit.grid.rows.length; gy++) {
+                var grow = blit.grid.rows[gy];
+                for (var gx = 0; gx < grow.length; gx++) {
+                    var at = grow[gx] >> 8;
+                    var fgIdx = at & 0x07;
+                    var bgIdx = (at >> 4) & 0x07;
+                    cells++;
+                    if ((fgIdx >= 1 && fgIdx <= 6) || (bgIdx >= 1 && bgIdx <= 6))
+                        chroma++;
+                }
+            }
+            if (cells > 0 && chroma / cells < 0.15)
+                PALETTE_SEQ = SEQ_GRAYSCALE;
+        }
         var lyrics = track.lyrics && track.lyrics.length
             ? track.lyrics
             : distributeLyrics(track.flatLyrics || "", totalSec);
@@ -2114,6 +2157,9 @@ var FLPlayer;
                     rings = [];
                     drawStrobe(margins, 0, 0); // clear the margins
                     checkerDirty = true;
+                    drawHints(l);
+                    if (lyricIdx >= 0 && lyrics.length)
+                        drawLyric(l, lyrics[lyricIdx].text, lyricColor, 1);
                 }
             }
             for (var a = 0; a < ev.arrows.length; a++) {
@@ -2218,8 +2264,8 @@ var FLPlayer;
                 if (mode === "glow+art" && beat && blit.grid &&
                     now - artFlashAt > 450) {
                     artFlashAt = now;
-                    palStep = (palStep + 1) % PALETTE_SEQ.length;
-                    blit.pal = PALETTE_SEQ[palStep];
+                    palStep = PALETTE_SEQ.length ? (palStep + 1) % PALETTE_SEQ.length : 0;
+                    blit.pal = PALETTE_SEQ.length ? PALETTE_SEQ[palStep] : 0;
                     drawArt(blit);
                     drawSprites(sprites, l, blit, true);
                 }
@@ -2230,12 +2276,14 @@ var FLPlayer;
                 var bg = BG_MODES[bgMode];
                 if (bg === "auto")
                     bg = AUTO_EFFECTS[autoIdx]; // rotated by the music above
+                var bgPainted = false;
                 if (margins.length && BG_MODES[bgMode] !== "off" && !paused) {
                     fieldTick++;
                     if ((BG_MODES[bgMode] === "auto" || BG_MODES[bgMode] === "strobe") && hardBeat)
                         strobeLevel = 3;
                     if (strobeLevel > 0) {
                         drawStrobe(margins, strobeLevel, features.zcr);
+                        bgPainted = true;
                         strobeLevel--;
                         if (strobeLevel === 0)
                             checkerDirty = true; // repaint pattern after decay
@@ -2247,6 +2295,7 @@ var FLPlayer;
                         }
                         if (checkerDirty) {
                             drawChecker(margins, checkerPhase, features.rms, features.zcr);
+                            bgPainted = true;
                             checkerDirty = false;
                         }
                     }
@@ -2254,8 +2303,10 @@ var FLPlayer;
                         plasmaT += 0.10 + features.rms * 0.35;
                         if (beat)
                             plasmaT += 1.2;
-                        if (fieldTick % 2 === 0 || beat)
+                        if (fieldTick % 2 === 0 || beat) {
                             drawPlasma(margins, plasmaT, features.zcr);
+                            bgPainted = true;
+                        }
                     }
                     else if (bg === "ripple") {
                         if (beat && rings.length < 4) {
@@ -2270,8 +2321,10 @@ var FLPlayer;
                             if (rings[ri].r > l.cols)
                                 rings.splice(ri, 1);
                         }
-                        if (rings.length && (fieldTick % 2 === 0 || beat))
+                        if (rings.length && (fieldTick % 2 === 0 || beat)) {
                             drawRipples(margins, rings, features.zcr);
+                            bgPainted = true;
+                        }
                     }
                 }
                 if (mode !== "off" && borderPulse > 0) {
@@ -2310,7 +2363,14 @@ var FLPlayer;
                         if (prog >= 1)
                             lyricSweepAt = 0;
                     }
+                    else if (bgPainted && lyricIdx >= 0) {
+                        // The effect just painted over the lyric row's padding
+                        // AND its text; put the settled line back on top.
+                        drawLyric(l, lyrics[lyricIdx].text, lyricColor, 1);
+                    }
                 }
+                if (bgPainted)
+                    drawHints(l);
                 drawProgress(l, clamp(playMs / 1000, 0, totalSec), totalSec, paused, volumePct);
                 console.write(gotoRC(l.rows, l.cols) + CLR);
             }
@@ -2476,21 +2536,31 @@ var FLPlayer;
             srcRow: 0, srcCol: 0, nRows: 30, nCols: 80, pal: 0
         };
         var mrs = marginRects(fakeL, fakeBlit);
+        var stripRows = false;
         var flankL = false;
         var flankR = false;
         for (var mi = 0; mi < mrs.length; mi++) {
             var mr = mrs[mi];
-            if (mr.y === 33 && mr.x === 1 && mr.x + mr.w - 1 === 22)
+            // Full-width strips over the glow/lyric rows (text rides on top).
+            if (mr.y === fakeL.glowRow1 && mr.h === 3 && mr.x === 1 && mr.w === fakeL.cols)
+                stripRows = true;
+            // Box-row flanks around the opaque box.
+            if (mr.y === fakeL.boxTop && mr.x === 1 && mr.x + mr.w - 1 === fakeL.boxLeft - 1)
                 flankL = true;
-            if (mr.y === 33 && mr.x === 99 && mr.x + mr.w - 1 === 120)
+            if (mr.y === fakeL.boxTop && mr.x === fakeL.boxLeft + fakeL.boxWidth)
                 flankR = true;
-            if (mr.y >= fakeL.glowRow1 &&
-                mr.x <= fakeL.boxLeft + fakeL.boxWidth - 1 &&
-                mr.x + mr.w - 1 >= fakeL.boxLeft)
-                throw new Error("bottom flank overlaps the box span");
+            // The one hard invariant: nothing may overlap the box RECT itself
+            // (box rows AND box columns simultaneously).
+            var rowsHit = mr.y <= fakeL.boxTop + 3 && mr.y + mr.h - 1 >= fakeL.boxTop;
+            var colsHit = mr.x <= fakeL.boxLeft + fakeL.boxWidth - 1 &&
+                mr.x + mr.w - 1 >= fakeL.boxLeft;
+            if (rowsHit && colsHit)
+                throw new Error("margin rect overlaps the box rect");
         }
+        if (!stripRows)
+            throw new Error("glow/lyric strip rects missing");
         if (!flankL || !flankR)
-            throw new Error("bottom flanks missing");
+            throw new Error("box-row flanks missing");
         writeln("FLPlayer self-test: OK");
         // Optional end-to-end leg: --selftest <mp3path> exercises the real
         // ffmpeg transcode + header parse + slicing on an actual track.
