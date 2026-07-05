@@ -1184,14 +1184,14 @@ namespace FLPlayer {
             redrawAll();
         }
 
-        // Drop any input that leaked in before this track took the keyboard
-        // (auto-repeat dregs from the previous track; buffered intent was
-        // already honored by the caller between tracks).
-        for (var fl = 0; fl < 64; fl++) {
-            var stale = console.inkey(K_NONE, 0);
-            if (typeof stale !== "string" || !stale.length)
-                break;
-        }
+        // Drop input that leaked in before this track took the keyboard
+        // (auto-repeat dregs; buffered intent was already honored by the
+        // caller between tracks). This MUST go through the pump, not raw
+        // zero-timeout inkey reads: a raw flush can bisect an in-flight CSI
+        // reply and leave a tail like "0n" that the next pump reads as plain
+        // keys — the 'n' became a phantom [N]ext that fought P presses. The
+        // pump reassembles sequences and keeps partials buffered instead.
+        pump.pump(40);
 
         redrawAll();
 
