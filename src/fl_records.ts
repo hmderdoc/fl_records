@@ -1320,8 +1320,16 @@ interface AppState {
             console.writeln("Audio sink: " + (sink === "syncterm" ? "SyncTERM (libsndfile)" : "APC bridge"));
 
             var idx = typeof index === "number" ? index : 0;
+            var transitionPump = new FLPlayer.InputPump();
             while (bbs.online && !js.terminated) {
                 var cur = (list && list.length) ? list[idx] : track;
+                // Immediate feedback for the inter-track gap (tag parse +
+                // possible transcode): a visible loading banner, so nobody
+                // double-presses N thinking the first one was ignored.
+                console.clear();
+                console.writeln("");
+                console.writeln("  Loading: " + toScreenText(displayTrackTitle(cur)));
+                console.writeln("");
                 var parsed = parseTrackTags(cur.path, {
                     includeLyrics: true,
                     includeAnsiArt: true
@@ -1354,18 +1362,39 @@ interface AppState {
                     avatars: trackAvatars(cur)
                 };
                 var outcome = FLPlayer.playTrack(playable);
+                // Honor whatever was pressed while the player was tearing
+                // down / the next track was loading: Q still quits, and
+                // buffered N/P adjust how far we move — no more sailing past
+                // the track you wanted.
+                var buffered = transitionPump.pump(80);
+                var extra = 0;
+                var quitBuffered = buffered.esc;
+                for (var bi = 0; bi < buffered.keys.length; bi++) {
+                    if (buffered.keys[bi] === "Q")
+                        quitBuffered = true;
+                    else if (buffered.keys[bi] === "N")
+                        extra++;
+                    else if (buffered.keys[bi] === "P")
+                        extra--;
+                }
+                if (quitBuffered)
+                    return;
                 // Jukebox flow: a song ending naturally advances to the next
                 // track in the filtered list; N/P move manually; Q/Esc exits.
                 if (outcome === "next" || outcome === "ended") {
-                    if (!list || !list.length || idx + 1 >= list.length)
+                    if (!list || !list.length)
                         return;
-                    idx++;
+                    var target = idx + 1 + extra;
+                    if (target >= list.length)
+                        return;
+                    idx = target < 0 ? 0 : target;
                     continue;
                 }
                 if (outcome === "prev") {
                     if (!list || !list.length)
                         return;
-                    idx = idx > 0 ? idx - 1 : 0;
+                    var back = idx - 1 + extra;
+                    idx = back < 0 ? 0 : (back >= list.length ? list.length - 1 : back);
                     continue;
                 }
                 return;

@@ -1171,6 +1171,15 @@ namespace FLPlayer {
             redrawAll();
         }
 
+        // Drop any input that leaked in before this track took the keyboard
+        // (auto-repeat dregs from the previous track; buffered intent was
+        // already honored by the caller between tracks).
+        for (var fl = 0; fl < 64; fl++) {
+            var stale = console.inkey(K_NONE, 0);
+            if (typeof stale !== "string" || !stale.length)
+                break;
+        }
+
         redrawAll();
 
         apc("A;Volume;C=" + CHANNEL + ";V=" + volumePct);
