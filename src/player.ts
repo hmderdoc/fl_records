@@ -1238,8 +1238,8 @@ namespace FLPlayer {
                     if (gr === dropRow)
                         continue;
                     var jx = nx + Math.floor(Math.random() * 5) - 2;
-                    console.write(FLAnsiGrid.emit(face, Math.max(1, jx), ny + gr,
-                        gr, 1, 0, AVATAR_W, 4));
+                    console.write(FLAnsiGrid.emitFlash(face, Math.max(1, jx), ny + gr,
+                        gr, 1, 0, AVATAR_W, gr * 2 + s.glitch * 4 + 6));
                 }
                 s.pad = 2;
             } else {
@@ -1251,9 +1251,10 @@ namespace FLPlayer {
                     s.pad = 1;      // the shake spills a column either side
                 }
                 if (s.flash > 0) {
-                    // Palette strobe: walk the swap maps for a few frames.
-                    console.write(FLAnsiGrid.emit(face, wx, ny, 0, AVATAR_H, 0, AVATAR_W,
-                        1 + ((s.flash + i) % (FLAnsiGrid.PALETTES.length - 1))));
+                    // Palette strobe: rotate the whole colour wheel a few frames
+                    // per beat -- grays and white included, BLACK pinned.
+                    console.write(FLAnsiGrid.emitFlash(face, wx, ny, 0, AVATAR_H, 0, AVATAR_W,
+                        s.flash * 3 + i + 4));
                     s.flash--;
                 } else {
                     console.write(FLAnsiGrid.emit(face, wx, ny, 0, AVATAR_H, 0, AVATAR_W, 0));
@@ -1878,6 +1879,12 @@ namespace FLPlayer {
         var av = FLAnsiGrid.renderBin(bin, 10, 6);
         if (!av || av.height !== 6 || (av.rows[0][0] & 0xff) !== 65)
             throw new Error("renderBin failed");
+
+        // Avatar flash rotation: BLACK (fg 0) pinned, LIGHTGRAY (fg 7) moves.
+        var fg: any = { width: 2, height: 1, rows: [[(0x00 << 8) | 0x41, (0x07 << 8) | 0x42]] };
+        var fs = FLAnsiGrid.emitFlash(fg, 1, 1, 0, 1, 0, 2, 5);
+        if (fs.indexOf(";30;") < 0) throw new Error("emitFlash moved BLACK");
+        if (fs.indexOf(";37;") >= 0) throw new Error("emitFlash left LIGHTGRAY unchanged");
 
         // Horizontal mirror: cells reverse per row and directional glyphs swap.
         var mg = FLAnsiGrid.render("/(\xDD", 3);

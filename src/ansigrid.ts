@@ -258,6 +258,56 @@ namespace FLAnsiGrid {
         return out;
     }
 
+    // Full 16-colour rotation with BLACK pinned. The PALETTES model only
+    // permutes the 3-bit BASE colour (so DARKGRAY = base-0 + bright shares a
+    // slot with BLACK and can't move independently, and LIGHTGRAY/WHITE stay
+    // put in most maps). This rotates all 15 non-black foreground colours (and
+    // the 7 non-black backgrounds) by `rot`, so grayscale strobes through
+    // colour on a beat while BLACK stays black.
+    function rotFg(full: number, rot: number): number {
+        return full === 0 ? 0 : (((full - 1 + rot) % 15) + 15) % 15 + 1;
+    }
+    function rotBg(base: number, rot: number): number {
+        return base === 0 ? 0 : (((base - 1 + rot) % 7) + 7) % 7 + 1;
+    }
+    function flashSgr(attr: number, rot: number): string {
+        var fgFull = (attr & 0x07) | ((attr & 0x08) ? 8 : 0);
+        var nfg = rotFg(fgFull, rot);
+        var nbg = rotBg((attr >> 4) & 0x07, rot);
+        var out = "0";
+        if (nfg & 0x08) out += ";1";
+        if (attr & 0x80) out += ";5";
+        out += ";" + CGA_TO_SGR[nfg & 0x07] + ";" + (CGA_TO_SGR[nbg] + 10);
+        return out;
+    }
+
+    /** emit(), but colours are rotated by `rot` (BLACK pinned) -- the grayscale-
+     *  inclusive palette strobe used for avatar flashes. */
+    export function emitFlash(grid: Grid, left: number, top: number,
+        srcRow: number, nRows: number, srcCol: number, nCols: number,
+        rot: number): string {
+        var out = "";
+        var lastSgr = "";
+        for (var r = 0; r < nRows; r++) {
+            var gy = srcRow + r;
+            if (gy < 0 || gy >= grid.rows.length)
+                continue;
+            var row = grid.rows[gy];
+            out += "\x1b[" + (top + r) + ";" + left + "H";
+            for (var cIdx = 0; cIdx < nCols; cIdx++) {
+                var gx = srcCol + cIdx;
+                var cell = gx >= 0 && gx < row.length ? row[gx] : ((DEFAULT_ATTR << 8) | 0x20);
+                var code = flashSgr(cell >> 8, rot);
+                if (code !== lastSgr) {
+                    out += "\x1b[" + code + "m";
+                    lastSgr = code;
+                }
+                out += String.fromCharCode(cell & 0xff);
+            }
+        }
+        return out + "\x1b[0m";
+    }
+
     /**
      * Blit a window of the grid to the screen: source rows [srcRow, srcRow+nRows)
      * and cols [srcCol, srcCol+nCols) drawn with the top-left at screen

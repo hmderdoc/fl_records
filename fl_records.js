@@ -1066,6 +1066,55 @@ var FLAnsiGrid;
         return out;
     }
     FLAnsiGrid.attrToSgr = attrToSgr;
+    // Full 16-colour rotation with BLACK pinned. The PALETTES model only
+    // permutes the 3-bit BASE colour (so DARKGRAY = base-0 + bright shares a
+    // slot with BLACK and can't move independently, and LIGHTGRAY/WHITE stay
+    // put in most maps). This rotates all 15 non-black foreground colours (and
+    // the 7 non-black backgrounds) by `rot`, so grayscale strobes through
+    // colour on a beat while BLACK stays black.
+    function rotFg(full, rot) {
+        return full === 0 ? 0 : (((full - 1 + rot) % 15) + 15) % 15 + 1;
+    }
+    function rotBg(base, rot) {
+        return base === 0 ? 0 : (((base - 1 + rot) % 7) + 7) % 7 + 1;
+    }
+    function flashSgr(attr, rot) {
+        var fgFull = (attr & 0x07) | ((attr & 0x08) ? 8 : 0);
+        var nfg = rotFg(fgFull, rot);
+        var nbg = rotBg((attr >> 4) & 0x07, rot);
+        var out = "0";
+        if (nfg & 0x08)
+            out += ";1";
+        if (attr & 0x80)
+            out += ";5";
+        out += ";" + CGA_TO_SGR[nfg & 0x07] + ";" + (CGA_TO_SGR[nbg] + 10);
+        return out;
+    }
+    /** emit(), but colours are rotated by `rot` (BLACK pinned) -- the grayscale-
+     *  inclusive palette strobe used for avatar flashes. */
+    function emitFlash(grid, left, top, srcRow, nRows, srcCol, nCols, rot) {
+        var out = "";
+        var lastSgr = "";
+        for (var r = 0; r < nRows; r++) {
+            var gy = srcRow + r;
+            if (gy < 0 || gy >= grid.rows.length)
+                continue;
+            var row = grid.rows[gy];
+            out += "\x1b[" + (top + r) + ";" + left + "H";
+            for (var cIdx = 0; cIdx < nCols; cIdx++) {
+                var gx = srcCol + cIdx;
+                var cell = gx >= 0 && gx < row.length ? row[gx] : ((DEFAULT_ATTR << 8) | 0x20);
+                var code = flashSgr(cell >> 8, rot);
+                if (code !== lastSgr) {
+                    out += "\x1b[" + code + "m";
+                    lastSgr = code;
+                }
+                out += String.fromCharCode(cell & 0xff);
+            }
+        }
+        return out + "\x1b[0m";
+    }
+    FLAnsiGrid.emitFlash = emitFlash;
     /**
      * Blit a window of the grid to the screen: source rows [srcRow, srcRow+nRows)
      * and cols [srcCol, srcCol+nCols) drawn with the top-left at screen
@@ -2224,7 +2273,7 @@ var FLPlayer;
                     if (gr === dropRow)
                         continue;
                     var jx = nx + Math.floor(Math.random() * 5) - 2;
-                    console.write(FLAnsiGrid.emit(face, Math.max(1, jx), ny + gr, gr, 1, 0, AVATAR_W, 4));
+                    console.write(FLAnsiGrid.emitFlash(face, Math.max(1, jx), ny + gr, gr, 1, 0, AVATAR_W, gr * 2 + s.glitch * 4 + 6));
                 }
                 s.pad = 2;
             }
@@ -2237,8 +2286,9 @@ var FLPlayer;
                     s.pad = 1; // the shake spills a column either side
                 }
                 if (s.flash > 0) {
-                    // Palette strobe: walk the swap maps for a few frames.
-                    console.write(FLAnsiGrid.emit(face, wx, ny, 0, AVATAR_H, 0, AVATAR_W, 1 + ((s.flash + i) % (FLAnsiGrid.PALETTES.length - 1))));
+                    // Palette strobe: rotate the whole colour wheel a few frames
+                    // per beat -- grays and white included, BLACK pinned.
+                    console.write(FLAnsiGrid.emitFlash(face, wx, ny, 0, AVATAR_H, 0, AVATAR_W, s.flash * 3 + i + 4));
                     s.flash--;
                 }
                 else {
@@ -2861,6 +2911,13 @@ var FLPlayer;
         var av = FLAnsiGrid.renderBin(bin, 10, 6);
         if (!av || av.height !== 6 || (av.rows[0][0] & 0xff) !== 65)
             throw new Error("renderBin failed");
+        // Avatar flash rotation: BLACK (fg 0) pinned, LIGHTGRAY (fg 7) moves.
+        var fg = { width: 2, height: 1, rows: [[(0x00 << 8) | 0x41, (0x07 << 8) | 0x42]] };
+        var fs = FLAnsiGrid.emitFlash(fg, 1, 1, 0, 1, 0, 2, 5);
+        if (fs.indexOf(";30;") < 0)
+            throw new Error("emitFlash moved BLACK");
+        if (fs.indexOf(";37;") >= 0)
+            throw new Error("emitFlash left LIGHTGRAY unchanged");
         // Horizontal mirror: cells reverse per row and directional glyphs swap.
         var mg = FLAnsiGrid.render("/(\xDD", 3);
         var mm = FLAnsiGrid.mirror(mg);
