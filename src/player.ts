@@ -233,9 +233,19 @@ namespace FLPlayer {
         other: string[];      // CSI sequences we do not handle (diagnostics)
     }
 
+    function parseAudioBody(parts: string[], res: PumpResult): void {
+        for (var i = 1; i + 1 < parts.length + 1; i += 2) {
+            var id = parseInt(parts[i], 10);
+            var st = parseInt(parts[i + 1], 10);
+            if (!isNaN(id) && !isNaN(st))
+                res.audio.push([id, st]);
+        }
+    }
+
     export class InputPump {
         private buf: string = "";
-        private escAt: number = 0;   // when a lone ESC started waiting
+        private escAt: number = 0;     // when a lone ESC started waiting
+        private bracketAt: number = 0; // when a possible orphaned tail started waiting
 
         /** Poll for up to maxMs, decoding everything that arrives. */
         pump(maxMs: number): PumpResult {
@@ -259,6 +269,41 @@ namespace FLPlayer {
                     return;
                 var c = this.buf.charAt(0);
                 if (c !== "\x1b") {
+                    // Orphaned reply tails: the engine's getdimensions() reader
+                    // can consume the ESC of an in-flight notify while hunting
+                    // its own CPR answer, leaving "[=7;2;0n" as bare text whose
+                    // trailing 'n' reads as a phantom [N]ext (flight-recorder
+                    // confirmed). Recognize the two known reply shapes before
+                    // treating '[' as a keystroke.
+                    if (c === "[") {
+                        var oa = /^\[(=7[0-9;]*)n/.exec(this.buf);
+                        if (oa) {
+                            parseAudioBody(oa[1].substr(2).split(";"), res);
+                            this.buf = this.buf.substr(oa[0].length);
+                            this.bracketAt = 0;
+                            continue;
+                        }
+                        var oc = /^\[(\d{1,4});(\d{1,4})R/.exec(this.buf);
+                        if (oc) {
+                            res.cpr.push([parseInt(oc[1], 10), parseInt(oc[2], 10)]);
+                            this.buf = this.buf.substr(oc[0].length);
+                            this.bracketAt = 0;
+                            continue;
+                        }
+                        // Could still be an incomplete orphan: wait briefly.
+                        if (/^\[[=0-9;]{0,12}$/.test(this.buf)) {
+                            if (!idle)
+                                return;
+                            if (!this.bracketAt) {
+                                this.bracketAt = nowMs();
+                                return;
+                            }
+                            if (nowMs() - this.bracketAt < 250)
+                                return;
+                            // Aged out: it really is a '[' keystroke.
+                        }
+                        this.bracketAt = 0;
+                    }
                     res.keys.push(c.toUpperCase());
                     this.buf = this.buf.substr(1);
                     continue;
@@ -298,14 +343,8 @@ namespace FLPlayer {
                 var body = m[1];
                 var fin = m[2];
                 if (fin === "n" && body.substr(0, 2) === "=7") {
-                    var parts = body.substr(2).split(";");
                     // "=7;a;b[;c;d...]n" -> leading empty from ";a" split
-                    for (var i = 1; i + 1 < parts.length + 1; i += 2) {
-                        var id = parseInt(parts[i], 10);
-                        var st = parseInt(parts[i + 1], 10);
-                        if (!isNaN(id) && !isNaN(st))
-                            res.audio.push([id, st]);
-                    }
+                    parseAudioBody(body.substr(2).split(";"), res);
                 } else if (fin === "R") {
                     var rc = body.split(";");
                     var pr = parseInt(rc[0], 10);
@@ -1182,7 +1221,10 @@ namespace FLPlayer {
         var plasmaT = 0;
         var rings: Ripple[] = [];
         var fieldTick = 0;            // field effects repaint on alternate ticks
-        var lastProbeAt = 0;
+        var lastProbeAt = nowMs();   // no probe on the first iterations: the
+                                     // previous track's drain notify is in
+                                     // flight then, and the engine's reply
+                                     // reader must not race it
         var lastConsoleCols = console.screen_columns || 0;
         var lastConsoleRows = console.screen_rows || 0;
         var cprSeen = 0;              // resize diagnostics (corner readout)
@@ -1448,7 +1490,7 @@ namespace FLPlayer {
                 cprSeen++;
                 relayout(ev.cpr[cp][1], ev.cpr[cp][0]);
             }
-            if (now - lastProbeAt >= 2000) {
+            if (now - lastProbeAt >= 2000 && now - lastFlushAt >= 3000) {
                 lastProbeAt = now;
                 // In-process, the terminal layer CONSUMES raw CPR replies (they
                 // feed the engine's own cursor machinery and never reach
@@ -1782,6 +1824,30 @@ namespace FLPlayer {
             for (var pk = 0; pk < 8; pk++)
                 if (!seenIdx[pk]) throw new Error("palette " + pi + " not a permutation");
         }
+
+        // Orphaned notify tail (the flight-recorder shred): the engine ate
+        // the ESC; the bare tail must become an audio event, NOT keys ending
+        // in a phantom 'N'.
+        var pOrf = new InputPump();
+        var rOrf: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        (pOrf as any).buf = "[=7;2;0n";
+        (pOrf as any).drain(rOrf, true);
+        if (rOrf.keys.length) throw new Error("orphan tail leaked keys: " + rOrf.keys.join(""));
+        if (rOrf.audio.length !== 1 || rOrf.audio[0][0] !== 2 || rOrf.audio[0][1] !== 0)
+            throw new Error("orphan tail not recovered as audio");
+        // Orphaned CPR tail likewise.
+        var rOrf2: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        (pOrf as any).buf = "[74;162R";
+        (pOrf as any).drain(rOrf2, true);
+        if (rOrf2.keys.length || rOrf2.cpr.length !== 1 || rOrf2.cpr[0][0] !== 74)
+            throw new Error("orphan CPR not recovered");
+        // A real '[' keystroke still gets through once aged.
+        var rOrf3: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        (pOrf as any).buf = "[";
+        (pOrf as any).bracketAt = nowMs() - 300;
+        (pOrf as any).drain(rOrf3, true);
+        if (rOrf3.keys.length !== 1 || rOrf3.keys[0] !== "[")
+            throw new Error("aged bracket keystroke lost");
 
         // Split CSI across feeds must not produce phantom keys.
         var p2 = new InputPump();
