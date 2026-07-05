@@ -111,6 +111,8 @@ declare class File {
     writeln(text?: string): boolean;
     readAll(length?: number): string[];
     iniGetValue(section: string | null, key: string, defaultValue?: any): any;
+    iniGetSections(prefix?: string): string[];
+    iniGetObject(section?: string | null): any;
     position: number;
     length: number;
     error: number;

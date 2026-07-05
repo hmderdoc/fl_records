@@ -1561,13 +1561,40 @@ var FLPlayer;
         var strip = left + line + (l.boxWidth % 2 ? " " : "");
         console.write(gotoRC(row, l.boxLeft) + sgr(color) + strip.substr(0, l.boxWidth) + CLR);
     }
-    function drawLyric(l, text) {
+    // Each lyric line gets a random color pair (base, light) and sweeps in
+    // with a moving wave: cells near the crest render white -> light -> base,
+    // cells far away sit dark until the wave passes (the avatar_chat room
+    // join/leave effect, retargeted). Beats re-trigger short mini-sweeps.
+    var LYRIC_COLORS = [
+        ["0;33", "1;33"], ["0;36", "1;36"], ["0;35", "1;35"],
+        ["0;32", "1;32"], ["0;31", "1;31"], ["0;34", "1;36"]
+    ];
+    var LYRIC_SWEEP_MS = 1500;
+    function drawLyric(l, text, colorIdx, progress) {
         var t = text.length > l.boxWidth - 2 ? text.substr(0, l.boxWidth - 5) + "..." : text;
         var pad = l.boxWidth - t.length;
         var lead = Math.floor(pad / 2);
-        console.write(gotoRC(l.lyricRow, l.boxLeft) + CLR +
-            repeatByte(" ", lead) + sgr("1;33") + t + CLR +
-            repeatByte(" ", pad - lead));
+        var pair = LYRIC_COLORS[colorIdx % LYRIC_COLORS.length];
+        var out = gotoRC(l.lyricRow, l.boxLeft) + CLR + repeatByte(" ", lead);
+        if (progress >= 1 || !t.length) {
+            out += sgr(pair[1]) + t;
+        }
+        else {
+            // Wave enters/exits off the ends for a smooth arrival.
+            var margin = 5;
+            var waveX = progress * (t.length + margin * 2) - margin;
+            var last = "";
+            for (var i = 0; i < t.length; i++) {
+                var d = Math.abs(i - waveX);
+                var code = d < 1.6 ? "1;37" : d < 4.5 ? pair[1] : d < 8 ? pair[0] : "1;30";
+                if (code !== last) {
+                    out += sgr(code);
+                    last = code;
+                }
+                out += t.charAt(i);
+            }
+        }
+        console.write(out + CLR + repeatByte(" ", pad - lead));
     }
     // ---- background effects in the art margins --------------------------------
     // Whatever art-zone area the (centered) art does not cover gets a music-
@@ -1718,12 +1745,15 @@ var FLPlayer;
                 vy: 0.35 * (i % 2 === 0 ? 1 : -1),
                 drawnX: -1,
                 drawnY: -1,
-                trail: i % TRAIL_COLORS.length
+                trail: i % TRAIL_COLORS.length,
+                flash: 0,
+                glitch: 0,
+                pad: 0
             });
         }
         return sprites;
     }
-    function stepSprites(sprites, l, rms, beat) {
+    function stepSprites(sprites, l, rms, beat, hardBeat) {
         var minX = 1;
         var maxX = l.cols - AVATAR_W + 1;
         var minY = l.artTop;
@@ -1735,9 +1765,15 @@ var FLPlayer;
         for (i = 0; i < sprites.length; i++) {
             var s = sprites[i];
             if (beat) {
-                // Beat: a jolt — random kick plus a vertical jiggle.
+                // Beat: a jolt — random kick plus a vertical jiggle — and a
+                // quick palette strobe (3 frames through the swap maps).
                 s.vx += (Math.random() - 0.5) * 1.6;
                 s.vy += (Math.random() - 0.5) * 1.2;
+                s.flash = 3;
+            }
+            if (hardBeat) {
+                // Hard accent: glitch out — jittered rows in scramble colors.
+                s.glitch = 3;
             }
             // Clamp velocity so a pile of beats can't launch them.
             s.vx = clamp(s.vx, -1.6, 1.6);
@@ -1793,11 +1829,37 @@ var FLPlayer;
             var s = sprites[i];
             var nx = Math.round(s.x);
             var ny = Math.round(s.y);
-            if (!force && nx === s.drawnX && ny === s.drawnY)
+            var moved = nx !== s.drawnX || ny !== s.drawnY;
+            var animating = s.flash > 0 || s.glitch > 0 || s.pad > 0;
+            if (!force && !moved && !animating)
                 continue;
-            if (s.drawnX >= 0 && (nx !== s.drawnX || ny !== s.drawnY))
-                restoreRect(blit, l, s.drawnX, s.drawnY, AVATAR_W, AVATAR_H, TRAIL_COLORS[s.trail]);
-            console.write(FLAnsiGrid.emit(s.grid, nx, ny, 0, AVATAR_H, 0, AVATAR_W, 0));
+            if (s.drawnX >= 0 && (moved || s.pad > 0)) {
+                // Erase the previous frame (expanded by any glitch spill).
+                // Moving leaves a colored wake; in-place redraws restore clean.
+                restoreRect(blit, l, s.drawnX - s.pad, s.drawnY, AVATAR_W + s.pad * 2, AVATAR_H, moved ? TRAIL_COLORS[s.trail] : undefined);
+            }
+            s.pad = 0;
+            if (s.glitch > 0) {
+                // Glitch-out: each row lands with its own horizontal jitter,
+                // drawn through the scramble palette (and one dropped row).
+                s.glitch--;
+                var dropRow = Math.floor(Math.random() * AVATAR_H);
+                for (var gr = 0; gr < AVATAR_H; gr++) {
+                    if (gr === dropRow)
+                        continue;
+                    var jx = nx + Math.floor(Math.random() * 5) - 2;
+                    console.write(FLAnsiGrid.emit(s.grid, Math.max(1, jx), ny + gr, gr, 1, 0, AVATAR_W, 4));
+                }
+                s.pad = 2;
+            }
+            else if (s.flash > 0) {
+                // Palette strobe: walk the swap maps for a few frames.
+                console.write(FLAnsiGrid.emit(s.grid, nx, ny, 0, AVATAR_H, 0, AVATAR_W, 1 + ((s.flash + i) % (FLAnsiGrid.PALETTES.length - 1))));
+                s.flash--;
+            }
+            else {
+                console.write(FLAnsiGrid.emit(s.grid, nx, ny, 0, AVATAR_H, 0, AVATAR_W, 0));
+            }
             s.drawnX = nx;
             s.drawnY = ny;
         }
@@ -1885,6 +1947,8 @@ var FLPlayer;
             ? track.lyrics
             : distributeLyrics(track.flatLyrics || "", totalSec);
         var lyricIdx = -1;
+        var lyricColor = Math.floor(Math.random() * 6);
+        var lyricSweepAt = 0; // 0 = steady (no sweep running)
         function redrawAll() {
             drawBackdrop(track, l, blit);
             drawBoxFrame(l, "0;34");
@@ -2192,15 +2256,27 @@ var FLPlayer;
                 drawGlow(l, l.glowRow2, paused ? 0 : features.rms, features.zcr, glowOn);
                 // Floating avatars: physics every tick, redraw when they move.
                 if (sprites.length && !paused) {
-                    stepSprites(sprites, l, features.rms, beat);
+                    stepSprites(sprites, l, features.rms, beat, hardBeat);
                     drawSprites(sprites, l, blit, false);
                 }
-                // Synced lyric line between the strips.
+                // Synced lyric line between the strips: a new line launches a
+                // full color sweep in a fresh random color; beats mid-line
+                // re-trigger short mini-sweeps so held lines keep shimmering.
                 if (lyrics.length) {
                     var li = lyricIndexFor(lyrics, playMs / 1000, lyricIdx);
                     if (li !== lyricIdx) {
                         lyricIdx = li;
-                        drawLyric(l, li >= 0 ? lyrics[li].text : "");
+                        lyricColor = (lyricColor + 1 + Math.floor(Math.random() * (6 - 1))) % 6;
+                        lyricSweepAt = now;
+                    }
+                    else if (beat && li >= 0 && lyricSweepAt === 0) {
+                        lyricSweepAt = now - Math.floor(LYRIC_SWEEP_MS * 0.55);
+                    }
+                    if (lyricSweepAt > 0) {
+                        var prog = (now - lyricSweepAt) / LYRIC_SWEEP_MS;
+                        drawLyric(l, lyricIdx >= 0 ? lyrics[lyricIdx].text : "", lyricColor, clamp(prog, 0, 1));
+                        if (prog >= 1)
+                            lyricSweepAt = 0;
                     }
                 }
                 drawProgress(l, clamp(playMs / 1000, 0, totalSec), totalSec, paused, volumePct);
@@ -3050,7 +3126,55 @@ var FLPlayer;
             return lower(a.name) < lower(b.name) ? -1 : 1;
         });
     }
+    // Per-track tag overrides shared with the web records page: the web tag
+    // manager writes data/futureland-records/track-overrides.ini (section =
+    // lowercase filename), layering artist/title/etc over the file's ID3.
+    // Without this the door shows the raw engine tag ("Vektrax") while the
+    // web shows the assigned persona ("CINDER") — and resolves wrong avatars.
+    function loadTrackOverrides() {
+        var map = {};
+        var path = backslash(system.data_dir) + "futureland-records/track-overrides.ini";
+        if (!file_exists(path))
+            return map;
+        var f = new File(path);
+        if (!f.open("r"))
+            return map;
+        try {
+            var sections = f.iniGetSections() || [];
+            for (var i = 0; i < sections.length; i++) {
+                var obj = f.iniGetObject(sections[i]);
+                if (obj)
+                    map[lower(sections[i])] = obj;
+            }
+        }
+        catch (err) {
+            log(LOG_WARNING, "fl_records track overrides load failed: " + safeString(err));
+        }
+        finally {
+            f.close();
+        }
+        return map;
+    }
+    function applyTrackOverrides(tracks) {
+        var overrides = loadTrackOverrides();
+        var fields = ["title", "artist", "composer", "genre", "year", "album"];
+        for (var i = 0; i < tracks.length; i++) {
+            var ov = overrides[lower(tracks[i].name)];
+            if (!ov)
+                continue;
+            for (var fIdx = 0; fIdx < fields.length; fIdx++) {
+                var v = trimValue(ov[fields[fIdx]]);
+                if (v.length)
+                    tracks[i][fields[fIdx]] = v;
+            }
+        }
+    }
     function loadCatalog(forceRefresh) {
+        var tracks = loadCatalogInner(forceRefresh);
+        applyTrackOverrides(tracks);
+        return tracks;
+    }
+    function loadCatalogInner(forceRefresh) {
         var base = new FileBase(DIR_CODE);
         var list;
         var cache = forceRefresh ? {

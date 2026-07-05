@@ -750,7 +750,52 @@ interface AppState {
         });
     }
 
+    // Per-track tag overrides shared with the web records page: the web tag
+    // manager writes data/futureland-records/track-overrides.ini (section =
+    // lowercase filename), layering artist/title/etc over the file's ID3.
+    // Without this the door shows the raw engine tag ("Vektrax") while the
+    // web shows the assigned persona ("CINDER") — and resolves wrong avatars.
+    function loadTrackOverrides(): { [fname: string]: any } {
+        var map: { [fname: string]: any } = {};
+        var path = backslash(system.data_dir) + "futureland-records/track-overrides.ini";
+        if (!file_exists(path)) return map;
+        var f = new File(path);
+        if (!f.open("r")) return map;
+        try {
+            var sections = f.iniGetSections() || [];
+            for (var i = 0; i < sections.length; i++) {
+                var obj = f.iniGetObject(sections[i]);
+                if (obj) map[lower(sections[i])] = obj;
+            }
+        } catch (err) {
+            log(LOG_WARNING, "fl_records track overrides load failed: " + safeString(err));
+        } finally {
+            f.close();
+        }
+        return map;
+    }
+
+    function applyTrackOverrides(tracks: TrackSummary[]): void {
+        var overrides = loadTrackOverrides();
+        var fields = ["title", "artist", "composer", "genre", "year", "album"];
+        for (var i = 0; i < tracks.length; i++) {
+            var ov = overrides[lower(tracks[i].name)];
+            if (!ov) continue;
+            for (var fIdx = 0; fIdx < fields.length; fIdx++) {
+                var v = trimValue(ov[fields[fIdx]]);
+                if (v.length)
+                    (tracks[i] as any)[fields[fIdx]] = v;
+            }
+        }
+    }
+
     function loadCatalog(forceRefresh: boolean): TrackSummary[] {
+        var tracks = loadCatalogInner(forceRefresh);
+        applyTrackOverrides(tracks);
+        return tracks;
+    }
+
+    function loadCatalogInner(forceRefresh: boolean): TrackSummary[] {
         var base = new FileBase(DIR_CODE);
         var list: any[];
         var cache = forceRefresh ? {
