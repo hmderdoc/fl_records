@@ -1015,10 +1015,10 @@ interface AppState {
         var values: string[];
         while (bbs.online && !js.terminated) {
             options = [
-                "Search text         " + summarizeValue(app.filters.search, 34),
-                "Artist              " + summarizeValue(app.filters.artist || "All artists", 34),
-                "Composer            " + summarizeValue(app.filters.composer || "All composers", 34),
-                "Genre               " + summarizeValue(app.filters.genre || "All genres", 34),
+                "Search text         " + summarizeValue(app.filters.search, composeValueWidth()),
+                "Artist              " + summarizeValue(app.filters.artist || "All artists", composeValueWidth()),
+                "Composer            " + summarizeValue(app.filters.composer || "All composers", composeValueWidth()),
+                "Genre               " + summarizeValue(app.filters.genre || "All genres", composeValueWidth()),
                 "Clear all filters",
                 "Back"
             ];
@@ -1046,6 +1046,15 @@ interface AppState {
 
     function summarizeValue(value: string, maxLen: number): string {
         return truncateText(toScreenText(trimValue(value)), maxLen);
+    }
+
+    // How much room a field's value gets in the compose menus, given the ~20-col
+    // label. Grows with the terminal (80-col floor) so long briefs use the screen
+    // instead of being clipped to a fixed width in the middle of a big display.
+    function composeValueWidth(): number {
+        var cols = console.screen_columns || 80;
+        if (cols < 80) cols = 80;
+        return Math.max(34, cols - 28);
     }
 
     function wrapText(text: string, width: number): string[] {
@@ -1926,17 +1935,19 @@ interface AppState {
         var options: string[];
         var choice: number;
         var input: string | null;
+        var vw = composeValueWidth();
         while (bbs.online && !js.terminated) {
             options = [
-                "Song title          " + summarizeValue(state.songTitle, 34),
-                "Brief               " + summarizeValue(state.brief, 34),
-                "Genre               " + summarizeValue(state.genre, 34),
-                "Feel                " + summarizeValue(state.feel, 34),
-                "Tone                " + summarizeValue(state.tone, 34),
-                "Arrangement         " + summarizeValue(state.arrangement, 34),
-                "Extra notes         " + summarizeValue(state.notes, 34),
+                "Song title          " + summarizeValue(state.songTitle, vw),
+                "Brief               " + summarizeValue(state.brief, vw),
+                "Genre               " + summarizeValue(state.genre, vw),
+                "Feel                " + summarizeValue(state.feel, vw),
+                "Tone                " + summarizeValue(state.tone, vw),
+                "Arrangement         " + summarizeValue(state.arrangement, vw),
+                "Extra notes         " + summarizeValue(state.notes, vw),
                 "Back"
             ];
+            uifc.help_text = "The song's core. Brief is a plain-language description (what it's about, language, mood); Genre/Feel/Tone/Arrangement pick from lists. Enter edits a field, Esc goes back.";
             choice = uifc.list(WIN_ESC | WIN_SAV | WIN_ACT, "Song DNA", options, new uifc.list.CTX());
             if (choice < 0 || choice === 7) return;
             if (choice === 0) {
@@ -1965,12 +1976,13 @@ interface AppState {
         var choice: number;
         var input: string | null;
         while (bbs.online && !js.terminated) {
+            uifc.help_text = "Guide one lyric section. Notes steer it (a line or two of intent); Section text is exact words to keep. Leave both blank to let the AI write it.";
             choice = uifc.list(
                 WIN_ESC | WIN_SAV | WIN_ACT,
                 section.label,
                 [
-                    "Guidance notes      " + summarizeValue(sectionState.notes, 34),
-                    "Section text        " + summarizeValue(sectionState.text, 34),
+                    "Guidance notes      " + summarizeValue(sectionState.notes, composeValueWidth()),
+                    "Section text        " + summarizeValue(sectionState.text, composeValueWidth()),
                     "Clear section",
                     "Back"
                 ],
@@ -2004,14 +2016,15 @@ interface AppState {
                 for (var i = 0; i < FLRecordsData.sectionDefs.length; i += 1) {
                     section = FLRecordsData.sectionDefs[i];
                     var summary = state.sections[section.key];
-                    options.push(section.label + "          " + summarizeValue(summary.notes || summary.text, 34));
+                    options.push(section.label + "          " + summarizeValue(summary.notes || summary.text, composeValueWidth()));
                 }
                 options.push("Clear all guided sections");
             } else {
-                options.push("Edit freeform lyrics  " + summarizeValue(state.lyricsFreeform, 30));
+                options.push("Edit freeform lyrics  " + summarizeValue(state.lyricsFreeform, composeValueWidth()));
                 options.push("Clear freeform lyrics");
             }
             options.push("Back");
+            uifc.help_text = "How the lyrics get written. Freeform = write/paste the whole lyric; Guided = fill sections (verse, chorus...) with intent or exact lines. Blank sections are AI-written.";
             choice = uifc.list(WIN_ESC | WIN_SAV | WIN_ACT, "Lyrics Director", options, new uifc.list.CTX());
             if (choice < 0 || choice === options.length - 1) return;
             if (choice === 0) {
@@ -2047,20 +2060,21 @@ interface AppState {
         var choice: number;
         var input: string | null;
         while (bbs.online && !js.terminated) {
+            uifc.help_text = "The arrangement: instruments, groove, vocals, language, tempo, key, time signature and target length. All optional -- anything you leave blank the AI decides.";
             choice = uifc.list(
                 WIN_ESC | WIN_SAV | WIN_ACT,
                 "Music Direction",
                 [
-                    "Instrumentation     " + summarizeValue(state.instrumentation, 34),
-                    "Groove              " + summarizeValue(state.groove, 34),
-                    "Band                " + summarizeValue(state.band, 34),
-                    "Lead vocal          " + summarizeValue(state.leadvocal, 34),
-                    "Backing vocals      " + summarizeValue(state.backingvocal, 34),
-                    "Language            " + summarizeValue(state.language, 34),
-                    "Tempo               " + summarizeValue(getTempoLabel(state), 34),
-                    "Key                 " + summarizeValue(state.key, 34),
-                    "Time signature      " + summarizeValue(state.timesig, 34),
-                    "Duration (seconds)  " + summarizeValue(state.duration, 34),
+                    "Instrumentation     " + summarizeValue(state.instrumentation, composeValueWidth()),
+                    "Groove              " + summarizeValue(state.groove, composeValueWidth()),
+                    "Band                " + summarizeValue(state.band, composeValueWidth()),
+                    "Lead vocal          " + summarizeValue(state.leadvocal, composeValueWidth()),
+                    "Backing vocals      " + summarizeValue(state.backingvocal, composeValueWidth()),
+                    "Language            " + summarizeValue(state.language, composeValueWidth()),
+                    "Tempo               " + summarizeValue(getTempoLabel(state), composeValueWidth()),
+                    "Key                 " + summarizeValue(state.key, composeValueWidth()),
+                    "Time signature      " + summarizeValue(state.timesig, composeValueWidth()),
+                    "Duration (seconds)  " + summarizeValue(state.duration, composeValueWidth()),
                     "Back"
                 ],
                 new uifc.list.CTX()
@@ -2103,7 +2117,7 @@ interface AppState {
                 "Session Options",
                 [
                     "Memory mode         " + (state.memoryActive ? "Memory" : "Blank Slate"),
-                    "AI co-writer        " + summarizeValue(state.cowriter || "None", 34),
+                    "AI co-writer        " + summarizeValue(state.cowriter || "None", composeValueWidth()),
                     "Wait for response   " + (state.waitForResponse ? "Yes" : "No"),
                     "Back"
                 ],
@@ -2222,14 +2236,15 @@ interface AppState {
         var choice: number;
         var sendResult: string;
         while (bbs.online && !js.terminated) {
+            uifc.help_text = "Build a song request for Vektrax (the AI). Fill in as much or as little as you like across DNA / Lyrics / Music, Preview to see the prompt, then Send. Everything is optional.";
             choice = uifc.list(
                 WIN_ESC | WIN_SAV | WIN_ACT,
                 "Create / Compose",
                 [
-                    "Song DNA           " + summarizeValue(state.songTitle || state.genre || "Start here", 34),
-                    "Lyrics Director    " + summarizeValue(state.lyricMode === "guided" ? "Guided sections" : state.lyricsFreeform || "Freeform", 34),
-                    "Music Direction    " + summarizeValue(state.instrumentation || state.language || "Set arrangement", 34),
-                    "Session Options    " + summarizeValue(state.cowriter || (state.memoryActive ? "Memory" : "Blank Slate"), 34),
+                    "Song DNA           " + summarizeValue(state.songTitle || state.genre || "Start here", composeValueWidth()),
+                    "Lyrics Director    " + summarizeValue(state.lyricMode === "guided" ? "Guided sections" : state.lyricsFreeform || "Freeform", composeValueWidth()),
+                    "Music Direction    " + summarizeValue(state.instrumentation || state.language || "Set arrangement", composeValueWidth()),
+                    "Session Options    " + summarizeValue(state.cowriter || (state.memoryActive ? "Memory" : "Blank Slate"), composeValueWidth()),
                     "Randomize style",
                     "Preview prompt",
                     "Send to Vektrax",

@@ -51,6 +51,23 @@ namespace FLUifcShim {
         return t + rep(" ", width - t.length);
     }
 
+    // Word-wrap plain text into lines no wider than `width` (for multi-line
+    // help hints at the bottom of a menu, instead of one truncated line).
+    function wrapLines(text: string, width: number): string[] {
+        var words = String(text || "").split(/\s+/);
+        var lines: string[] = [];
+        var cur = "";
+        var i: number;
+        for (i = 0; i < words.length; i++) {
+            if (!words[i].length) continue;
+            if (!cur.length) cur = words[i];
+            else if (cur.length + 1 + words[i].length <= width) cur += " " + words[i];
+            else { lines.push(cur); cur = words[i]; }
+        }
+        if (cur.length) lines.push(cur);
+        return lines;
+    }
+
     // A centered double-line box; returns the interior origin/size.
     function drawBox(title: string, innerRows: number, innerCols: number):
         { top: number; left: number; rows: number; cols: number } {
@@ -103,9 +120,19 @@ namespace FLUifcShim {
         var box = drawBox(title, visible, widest);
         var helpText = shim.help_text || "";
         if (helpText.length) {
-            var hint = helpText.length > scrCols() - 4 ? helpText.substr(0, scrCols() - 4) : helpText;
-            console.write(gotoRC(scrRows(), Math.max(1, Math.floor((scrCols() - hint.length) / 2))) +
-                sgr("0;30;1") + hint + sgr("0"));
+            // Word-wrap the hint across the rows below the box (up to 3), instead
+            // of clipping it to one line -- so the compose menus can explain
+            // themselves. Centered + short, so it never touches the corner cell.
+            var hlines = wrapLines(helpText, scrCols() - 4);
+            var room = scrRows() - (box.top + box.rows);
+            var nHelp = Math.min(hlines.length, 3, Math.max(0, room));
+            var startRow = scrRows() - nHelp + 1;
+            for (var hli = 0; hli < nHelp; hli++) {
+                var hl = hlines[hli];
+                console.write(gotoRC(startRow + hli,
+                    Math.max(1, Math.floor((scrCols() - hl.length) / 2))) +
+                    sgr("0;30;1") + hl + sgr("0"));
+            }
             shim.help_text = "";
         }
 
