@@ -1815,8 +1815,15 @@ var FLPlayer;
         if (boxR <= l.cols)
             rects.push({ x: boxR, y: l.boxTop, w: l.cols - boxR + 1, h: boxH });
         var hintsRow = Math.min(l.rows, l.boxTop + 4);
-        if (hintsRow > l.boxTop + 3)
-            rects.push({ x: 1, y: hintsRow, w: l.cols, h: 1 });
+        if (hintsRow > l.boxTop + 3) {
+            // NEVER include the terminal's bottom-right cell: writing a glyph
+            // there wraps the cursor and SCROLLS the whole screen — every
+            // effect repaint shifted the display up a line (the smeared,
+            // repeated-status corruption on fTelnet and SyncTERM alike).
+            var hw = hintsRow >= l.rows ? l.cols - 1 : l.cols;
+            if (hw > 0)
+                rects.push({ x: 1, y: hintsRow, w: hw, h: 1 });
+        }
         return rects;
     }
     // The active background effect's cell sampler: returns [sgrCode, char]
@@ -2298,6 +2305,7 @@ var FLPlayer;
             apc("A;Update;C=" + CHANNEL);
         }
         dbg("playLoop start: " + track.name + " chunks=" + totalChunks);
+        console.write("\x1b[?25l"); // hide the cursor for the show
         while (bbs.online && !js.terminated) {
             var now = nowMs();
             var playMs = paused ? pausedMs : (now - t0);
@@ -2610,6 +2618,7 @@ var FLPlayer;
             }
         }
         apc("A;Flush;C=" + CHANNEL + ";O=250");
+        console.write("\x1b[?25h"); // cursor back for the menus
         dbg("playLoop exit: result=" + result);
         return result;
     }
@@ -2850,6 +2859,11 @@ var FLPlayer;
             throw new Error("glow/lyric strip rects missing");
         if (!flankL || !flankR)
             throw new Error("box-row flanks missing");
+        for (var sc = 0; sc < mrs.length; sc++) {
+            var sr = mrs[sc];
+            if (sr.y + sr.h - 1 >= fakeL.rows && sr.x + sr.w - 1 >= fakeL.cols)
+                throw new Error("margin rect covers the bottom-right cell (scroll bug)");
+        }
         writeln("FLPlayer self-test: OK");
         // Optional end-to-end leg: --selftest <mp3path> exercises the real
         // ffmpeg transcode + header parse + slicing on an actual track.
