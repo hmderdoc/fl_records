@@ -163,7 +163,8 @@ namespace FLUifcShim {
             } else if (k === "\r" || k === "\n") {
                 if (ctx) ctx.cur = cur;
                 return cur;
-            } else if (k === ESC || k === "q" || k === "Q") {
+            } else if (k === ESC || k === "q" || k === "Q" || k === "\b" || k === "\x7f") {
+                // Backspace (\x08/\x7f) closes the fly menu, like Esc.
                 if (ctx) ctx.cur = cur;
                 return -1;
             } else if (ctx && ctx.actionKeys && k &&

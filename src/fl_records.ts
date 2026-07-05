@@ -1765,21 +1765,21 @@ interface AppState {
     function addToPlaylistFlow(trackName: string, trackTitle: string): void {
         runUifcFlow(function (): void {
             var pls = loadPlaylists();
-            var options: string[] = ["[+ Create New Playlist]"];
+            var options: string[] = ["Back", "[+ Create New Playlist]"];
             for (var i = 0; i < pls.length; i += 1)
                 options.push(pls[i].name + "   (" + pls[i].tracks.length + ")");
-            uifc.help_text = "Add \"" + toScreenText(trackTitle) + "\" to a playlist. Choose one, or create a new playlist named for this song.";
+            uifc.help_text = "Add \"" + toScreenText(trackTitle) + "\" to a playlist. Choose one, or create a new playlist. Backspace/Esc/Back all close this.";
             var choice = uifc.list(WIN_ESC | WIN_SAV | WIN_ACT, "Add to Playlist", options, new uifc.list.CTX());
-            if (choice < 0) return;
-            if (choice === 0) {
+            if (choice <= 0) return;                       // Back (0) or Esc (<0)
+            if (choice === 1) {
                 var name = promptInput("New playlist name", "", 60, K_EDIT);
                 if (name === null || !trimValue(name).length) return;
-                plAddTrack(trimValue(name), trackName);   // creates if new, dedupes
+                plAddTrack(trimValue(name), trackName);    // creates if new, dedupes
                 uifc.msg("Added to \"" + trimValue(name) + "\".");
                 return;
             }
-            plAddTrack(pls[choice - 1].name, trackName);
-            uifc.msg("Added to \"" + pls[choice - 1].name + "\".");
+            plAddTrack(pls[choice - 2].name, trackName);
+            uifc.msg("Added to \"" + pls[choice - 2].name + "\".");
         });
     }
 
@@ -1854,28 +1854,30 @@ interface AppState {
             var mgrCtx = new uifc.list.CTX();
             while (bbs.online && !js.terminated) {
                 var pls = loadPlaylists();
-                var options: string[] = [];
+                var options: string[] = ["Back"];
                 for (var i = 0; i < pls.length; i += 1)
                     options.push(pls[i].name + "   (" + pls[i].tracks.length + " tracks)");
                 if (!pls.length) options.push("(no playlists yet - add songs from Browse or the player)");
-                uifc.help_text = "Your playlists. Select one to Play / Rename / Reorder / Delete. Add songs with ENTER in Browse or [A] in the player.";
+                uifc.help_text = "Your playlists. Select one to Play / Rename / Reorder / Delete. Add songs with ENTER in Browse or [A] in the player. Backspace/Esc go back.";
                 var choice = uifc.list(WIN_ESC | WIN_SAV | WIN_ACT, "Playlist Manager", options, mgrCtx);
-                if (choice < 0) return;
-                if (!pls.length) continue;
-                var pl = pls[choice];
+                if (choice <= 0) return;                   // Back (0) or Esc (<0)
+                if (!pls.length) continue;                 // the "(no playlists)" row
+                var pl = pls[choice - 1];
                 var action = uifc.list(WIN_ESC | WIN_SAV | WIN_ACT, pl.name + " (" + pl.tracks.length + ")",
-                    ["Play", "Rename", "Reorder songs", "Delete", "Back"], new uifc.list.CTX());
-                if (action === 0) {
+                    ["Back", "Play", "Rename", "Reorder songs", "Delete"], new uifc.list.CTX());
+                if (action <= 0) {
+                    continue;                              // Back (0) or Esc -> playlist list
+                } else if (action === 1) {
                     var built = playlistToTracks(pl);
                     if (!built.length) { uifc.msg("That playlist has no playable songs."); continue; }
                     toPlay = { list: built, index: 0, playlist: pl.name };
                     return;
-                } else if (action === 1) {
+                } else if (action === 2) {
                     var nn = promptInput("Rename playlist", pl.name, 60, K_EDIT);
                     if (nn !== null && trimValue(nn).length) plRename(pl.name, trimValue(nn));
-                } else if (action === 2) {
-                    reorderPlaylistUi(pl.name);
                 } else if (action === 3) {
+                    reorderPlaylistUi(pl.name);
+                } else if (action === 4) {
                     if (uifc.list(WIN_MID | WIN_SAV, "Delete \"" + pl.name + "\"?", ["No", "Yes"]) === 1)
                         plDelete(pl.name);
                 }
