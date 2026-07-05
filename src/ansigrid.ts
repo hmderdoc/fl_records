@@ -42,7 +42,11 @@ namespace FLAnsiGrid {
         [0, 1, 2, 3, 4, 5, 7, 6],   // 5 amber: white <-> brown (bright = gold)
         [0, 1, 2, 7, 4, 5, 6, 3],   // 6 ice: white <-> cyan
         [0, 1, 2, 3, 4, 7, 6, 5],   // 7 neon: white <-> magenta
-        [7, 1, 2, 3, 4, 5, 6, 0]    // 8 negative: black <-> white flash
+        [7, 1, 2, 3, 4, 5, 6, 0],   // 8 negative: black <-> white flash
+        // Black-movers: the void itself takes color, flooding the canvas.
+        [1, 0, 2, 3, 4, 5, 6, 7],   // 9 midnight: black <-> blue
+        [1, 0, 2, 7, 4, 5, 6, 3],   // 10 abyss duotone: black<->blue, white<->cyan
+        [4, 1, 2, 3, 0, 5, 6, 7]    // 11 ember: black <-> red
     ];
 
     /** Remove a trailing SAUCE record (and the EOF marker it follows). */

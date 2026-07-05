@@ -1039,8 +1039,8 @@ namespace FLPlayer {
         // Colorful art cycles the structure-preserving maps; grayscale-heavy
         // art (where those maps are invisible no-ops) gets the colorizers
         // that wash the grays — amber/ice/neon plus a negative flash.
-        var SEQ_COLORFUL = [0, 1, 0, 3, 0, 5, 0, 2, 0, 7, 0, 4, 0, 6];
-        var SEQ_GRAYSCALE = [0, 5, 0, 6, 0, 7, 0, 5, 0, 6, 0, 8];
+        var SEQ_COLORFUL = [0, 1, 0, 3, 0, 5, 0, 2, 0, 9, 0, 7, 0, 4, 0, 6];
+        var SEQ_GRAYSCALE = [0, 5, 0, 9, 0, 6, 0, 10, 0, 7, 0, 11, 0, 8];
         var PALETTE_SEQ = SEQ_COLORFUL;
         if (blit.grid) {
             var chroma = 0;

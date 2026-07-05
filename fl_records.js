@@ -775,7 +775,11 @@ var FLAnsiGrid;
         [0, 1, 2, 3, 4, 5, 7, 6], // 5 amber: white <-> brown (bright = gold)
         [0, 1, 2, 7, 4, 5, 6, 3], // 6 ice: white <-> cyan
         [0, 1, 2, 3, 4, 7, 6, 5], // 7 neon: white <-> magenta
-        [7, 1, 2, 3, 4, 5, 6, 0] // 8 negative: black <-> white flash
+        [7, 1, 2, 3, 4, 5, 6, 0], // 8 negative: black <-> white flash
+        // Black-movers: the void itself takes color, flooding the canvas.
+        [1, 0, 2, 3, 4, 5, 6, 7], // 9 midnight: black <-> blue
+        [1, 0, 2, 7, 4, 5, 6, 3], // 10 abyss duotone: black<->blue, white<->cyan
+        [4, 1, 2, 3, 0, 5, 6, 7] // 11 ember: black <-> red
     ];
     /** Remove a trailing SAUCE record (and the EOF marker it follows). */
     function stripSauce(art) {
@@ -1928,8 +1932,8 @@ var FLPlayer;
         // Colorful art cycles the structure-preserving maps; grayscale-heavy
         // art (where those maps are invisible no-ops) gets the colorizers
         // that wash the grays — amber/ice/neon plus a negative flash.
-        var SEQ_COLORFUL = [0, 1, 0, 3, 0, 5, 0, 2, 0, 7, 0, 4, 0, 6];
-        var SEQ_GRAYSCALE = [0, 5, 0, 6, 0, 7, 0, 5, 0, 6, 0, 8];
+        var SEQ_COLORFUL = [0, 1, 0, 3, 0, 5, 0, 2, 0, 9, 0, 7, 0, 4, 0, 6];
+        var SEQ_GRAYSCALE = [0, 5, 0, 9, 0, 6, 0, 10, 0, 7, 0, 11, 0, 8];
         var PALETTE_SEQ = SEQ_COLORFUL;
         if (blit.grid) {
             var chroma = 0;
