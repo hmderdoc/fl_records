@@ -1122,6 +1122,16 @@ var FLPlayer;
     var UI_TICK_MS = 150; // overlay/visualizer repaint cadence
     var SEEK_SECONDS = 10;
     var VOLUME_STEP = 10; // percent per Up/Down press
+    // Synchronet's console.inkey() COOKS recognized cursor keys into single
+    // control bytes (see key_defs.js) rather than passing the raw ESC[ sequence,
+    // so real arrow presses never reach the ESC-sequence decoder below. Map the
+    // cooked codes to navigation here so every consumer sees arrows uniformly.
+    // (KEY_DOWN is \x0a = '\n' — reading it as Enter is what made the song list's
+    // Down arrow "play" the track.)
+    var COOKED_NAV = {
+        "\x1e": "up", "\x0a": "down", "\x1d": "left", "\x06": "right",
+        "\x10": "pgup", "\x0e": "pgdn", "\x02": "home", "\x05": "end"
+    };
     var ART_WIDTH = 80; // classic ANSI art wrap column
     var AVATAR_W = 10; // Synchronet avatar cell dimensions
     var AVATAR_H = 6;
@@ -1287,6 +1297,12 @@ var FLPlayer;
                     return;
                 var c = this.buf.charAt(0);
                 if (c !== "\x1b") {
+                    var nav = COOKED_NAV[c];
+                    if (nav) {
+                        res.arrows.push(nav);
+                        this.buf = this.buf.substr(1);
+                        continue;
+                    }
                     // Orphaned reply tails: the engine's getdimensions() reader
                     // can consume the ESC of an in-flight notify while hunting
                     // its own CPR answer, leaving "[=7;2;0n" as bare text whose
@@ -2806,6 +2822,17 @@ var FLPlayer;
         pSS3s.drain(rSS3s, true);
         if (rSS3s.arrows.length !== 1 || rSS3s.arrows[0] !== "up")
             throw new Error("split SS3 did not resolve to up");
+        // Synchronet cooks cursor keys into single control bytes (console.inkey);
+        // the pump must surface those as arrows. KEY_DOWN (\x0a) must NOT read as
+        // Enter -- that made the song list's Down arrow play the track.
+        var pNav = new InputPump();
+        var rNav = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        pNav.buf = "\x1e\x0a\x1d\x06\x10\x0e\x02\x05";
+        pNav.drain(rNav, true);
+        if (rNav.arrows.join(",") !== "up,down,left,right,pgup,pgdn,home,end")
+            throw new Error("cooked nav parse: " + rNav.arrows.join(","));
+        if (rNav.keys.length)
+            throw new Error("cooked nav leaked keys: " + rNav.keys.join(","));
         // The killer case: an audio notify split right after its ESC byte
         // must NOT become Esc + plain chars (the phantom 'N' bug).
         var pSplit = new InputPump();
@@ -4479,7 +4506,7 @@ var FLPlayer;
                 }
                 for (var ki = 0; ki < ev.keys.length && !done; ki += 1) {
                     var k = ev.keys[ki];
-                    if (k === "\r" || k === "\n") {
+                    if (k === "\r") { // Enter only; \n (0x0a) is KEY_DOWN, handled as an arrow
                         if (filtered.length) {
                             result = { list: filtered, index: sel };
                             done = true;
@@ -4510,10 +4537,14 @@ var FLPlayer;
                         sel = sel > 0 ? sel - 1 : Math.max(0, filtered.length - 1);
                     else if (d === "down")
                         sel = filtered.length ? (sel + 1) % filtered.length : 0;
-                    else if (d === "left")
+                    else if (d === "pgup" || d === "left")
                         sel = Math.max(0, sel - listH);
-                    else if (d === "right")
+                    else if (d === "pgdn" || d === "right")
                         sel = Math.min(Math.max(0, filtered.length - 1), sel + listH);
+                    else if (d === "home")
+                        sel = 0;
+                    else if (d === "end")
+                        sel = Math.max(0, filtered.length - 1);
                 }
             }
             console.write("\x1b[?25h" + CSI_RESET);

@@ -60,6 +60,17 @@ namespace FLPlayer {
     var UI_TICK_MS = 150;        // overlay/visualizer repaint cadence
     var SEEK_SECONDS = 10;
     var VOLUME_STEP = 10;        // percent per Up/Down press
+
+    // Synchronet's console.inkey() COOKS recognized cursor keys into single
+    // control bytes (see key_defs.js) rather than passing the raw ESC[ sequence,
+    // so real arrow presses never reach the ESC-sequence decoder below. Map the
+    // cooked codes to navigation here so every consumer sees arrows uniformly.
+    // (KEY_DOWN is \x0a = '\n' — reading it as Enter is what made the song list's
+    // Down arrow "play" the track.)
+    var COOKED_NAV: { [ch: string]: string } = {
+        "\x1e": "up", "\x0a": "down", "\x1d": "left", "\x06": "right",
+        "\x10": "pgup", "\x0e": "pgdn", "\x02": "home", "\x05": "end"
+    };
     var ART_WIDTH = 80;          // classic ANSI art wrap column
     var AVATAR_W = 10;           // Synchronet avatar cell dimensions
     var AVATAR_H = 6;
@@ -277,6 +288,12 @@ namespace FLPlayer {
                     return;
                 var c = this.buf.charAt(0);
                 if (c !== "\x1b") {
+                    var nav = COOKED_NAV[c];
+                    if (nav) {
+                        res.arrows.push(nav);
+                        this.buf = this.buf.substr(1);
+                        continue;
+                    }
                     // Orphaned reply tails: the engine's getdimensions() reader
                     // can consume the ESC of an in-flight notify while hunting
                     // its own CPR answer, leaving "[=7;2;0n" as bare text whose
@@ -1848,6 +1865,17 @@ namespace FLPlayer {
         (pSS3s as any).drain(rSS3s, true);
         if (rSS3s.arrows.length !== 1 || rSS3s.arrows[0] !== "up")
             throw new Error("split SS3 did not resolve to up");
+
+        // Synchronet cooks cursor keys into single control bytes (console.inkey);
+        // the pump must surface those as arrows. KEY_DOWN (\x0a) must NOT read as
+        // Enter -- that made the song list's Down arrow play the track.
+        var pNav = new InputPump();
+        var rNav: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        (pNav as any).buf = "\x1e\x0a\x1d\x06\x10\x0e\x02\x05";
+        (pNav as any).drain(rNav, true);
+        if (rNav.arrows.join(",") !== "up,down,left,right,pgup,pgdn,home,end")
+            throw new Error("cooked nav parse: " + rNav.arrows.join(","));
+        if (rNav.keys.length) throw new Error("cooked nav leaked keys: " + rNav.keys.join(","));
 
         // The killer case: an audio notify split right after its ESC byte
         // must NOT become Esc + plain chars (the phantom 'N' bug).

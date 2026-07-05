@@ -1603,7 +1603,7 @@ interface AppState {
                 }
                 for (var ki = 0; ki < ev.keys.length && !done; ki += 1) {
                     var k = ev.keys[ki];
-                    if (k === "\r" || k === "\n") {
+                    if (k === "\r") {   // Enter only; \n (0x0a) is KEY_DOWN, handled as an arrow
                         if (filtered.length) { result = { list: filtered, index: sel }; done = true; }
                     } else if (k === "\x08" || k === "\x7f") {
                         if (search.length) { search = search.substring(0, search.length - 1); sel = 0; recompute(); }
@@ -1617,8 +1617,10 @@ interface AppState {
                     var d = ev.arrows[ai];
                     if (d === "up") sel = sel > 0 ? sel - 1 : Math.max(0, filtered.length - 1);
                     else if (d === "down") sel = filtered.length ? (sel + 1) % filtered.length : 0;
-                    else if (d === "left") sel = Math.max(0, sel - listH);
-                    else if (d === "right") sel = Math.min(Math.max(0, filtered.length - 1), sel + listH);
+                    else if (d === "pgup" || d === "left") sel = Math.max(0, sel - listH);
+                    else if (d === "pgdn" || d === "right") sel = Math.min(Math.max(0, filtered.length - 1), sel + listH);
+                    else if (d === "home") sel = 0;
+                    else if (d === "end") sel = Math.max(0, filtered.length - 1);
                 }
             }
             console.write("\x1b[?25h" + CSI_RESET);
