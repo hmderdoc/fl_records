@@ -5152,10 +5152,15 @@ var FLPlayer;
         try {
             load("json-client.js");
             load(pathJoin(system.mods_dir, "load/json-chat.js"));
+            // JSONClient auto-connects in its constructor (and THROWS if the host
+            // is unreachable). JSONChat.connect() would then re-connect that live
+            // socket and return false -- so we must NOT call it. Instead set the
+            // author nick ourselves (the only thing connect() does that submit()
+            // needs) and go straight to join+submit. This mirrors future_shell's
+            // working pattern; calling connect() was the "Could not connect" bug.
             client = new JSONClient(chatOptions.host, chatOptions.port);
-            chat = new JSONChat(user.number, client);
-            if (!chat.connect())
-                return "Could not connect to JSON chat service.";
+            chat = new JSONChat(user.number, client, chatOptions.host, chatOptions.port);
+            chat.nick = { name: user.alias, host: system.name, ip: user.ip_address };
             chat.join(CHAT_CHANNEL);
             chat.submit(CHAT_CHANNEL, prompt);
             chat.disconnect();
@@ -5188,12 +5193,12 @@ var FLPlayer;
                 load("json-client.js");
                 load(pathJoin(system.mods_dir, "load/json-chat.js"));
                 client = new JSONClient(chatOptions.host, chatOptions.port);
-                chat = new JSONChat(user.number, client);
-                if (!chat.connect()) {
-                    console.writeln("Could not connect to JSON chat.");
-                    waitForAnyKey();
-                    return;
-                }
+                chat = new JSONChat(user.number, client, chatOptions.host, chatOptions.port);
+                // No chat.connect(): the JSONClient constructor already connected
+                // (and throws -> caught below if the host is unreachable). Set the
+                // nick and join to start receiving. Calling connect() re-connects
+                // the live socket and returns false -- the old bug.
+                chat.nick = { name: user.alias, host: system.name, ip: user.ip_address };
                 chat.join(CHAT_CHANNEL);
             }
             catch (err) {

@@ -147,6 +147,8 @@ declare class JSONChat {
     join(target: string): void;
     submit(target: string, text: string): boolean;
     cycle(): boolean;
+    client: JSONClient;
+    nick: any;   // { name, host, ip } -- set manually since connect() is skipped
     channels: {
         [name: string]: {
             name: string;
