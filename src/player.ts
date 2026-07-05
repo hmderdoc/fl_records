@@ -900,6 +900,8 @@ namespace FLPlayer {
     // on every beat. Erasing = restoring the art grid cells they vacated.
     interface Sprite {
         grid: FLAnsiGrid.Grid;
+        flipped: FLAnsiGrid.Grid;   // vertical-axis mirror (faces the other way)
+        facing: number;             // 1 = normal art, -1 = mirrored
         x: number;        // float position (screen cols/rows, 1-based)
         y: number;
         vx: number;
@@ -909,7 +911,8 @@ namespace FLPlayer {
         trail: number;    // TRAIL_COLORS index; shifts on bounces and beats
         flash: number;    // palette-strobe frames remaining (beats)
         glitch: number;   // glitch-out frames remaining (hard accents)
-        pad: number;      // horizontal spill of the last draw (glitch jitter)
+        wiggle: number;   // head-shake frames remaining (alternating +-1 col)
+        pad: number;      // horizontal spill of the last draw (glitch/wiggle)
     }
 
     var TRAIL_COLORS = ["0;35", "0;34", "0;36", "0;31", "0;32", "1;30"];
@@ -927,6 +930,8 @@ namespace FLPlayer {
                 continue;
             sprites.push({
                 grid: grid,
+                flipped: FLAnsiGrid.mirror(grid),
+                facing: (i % 2 === 0) ? 1 : -1,
                 x: i === 0 ? 3 : Math.max(3, zoneW - AVATAR_W - 2),
                 y: l.artTop + 1 + i * 2,
                 vx: (i % 2 === 0 ? 1 : -1) * 0.9,
@@ -936,6 +941,7 @@ namespace FLPlayer {
                 trail: i % TRAIL_COLORS.length,
                 flash: 0,
                 glitch: 0,
+                wiggle: 0,
                 pad: 0
             });
         }
@@ -964,7 +970,15 @@ namespace FLPlayer {
             if (hardBeat) {
                 // Hard accent: glitch out — jittered rows in scramble colors.
                 s.glitch = 3;
+            } else if (beat && s.wiggle === 0 && Math.random() < 0.35) {
+                // Some beats: a quick side-to-side head shake.
+                s.wiggle = 4;
             }
+            // Face the direction of travel (flips on bounces + collisions).
+            if (s.vx > 0.15)
+                s.facing = 1;
+            else if (s.vx < -0.15)
+                s.facing = -1;
             // Clamp velocity so a pile of beats can't launch them.
             s.vx = clamp(s.vx, -1.6, 1.6);
             s.vy = clamp(s.vy, -1.1, 1.1);
@@ -1000,7 +1014,7 @@ namespace FLPlayer {
             var nx = Math.round(s.x);
             var ny = Math.round(s.y);
             var moved = nx !== s.drawnX || ny !== s.drawnY;
-            var animating = s.flash > 0 || s.glitch > 0 || s.pad > 0;
+            var animating = s.flash > 0 || s.glitch > 0 || s.wiggle > 0 || s.pad > 0;
             if (!force && !moved && !animating)
                 continue;
             if (s.drawnX >= 0 && (moved || s.pad > 0)) {
@@ -1011,6 +1025,7 @@ namespace FLPlayer {
                     moved ? TRAIL_COLORS[s.trail] : undefined);
             }
             s.pad = 0;
+            var face = s.facing < 0 ? s.flipped : s.grid;
             if (s.glitch > 0) {
                 // Glitch-out: each row lands with its own horizontal jitter,
                 // drawn through the scramble palette (and one dropped row).
@@ -1020,17 +1035,26 @@ namespace FLPlayer {
                     if (gr === dropRow)
                         continue;
                     var jx = nx + Math.floor(Math.random() * 5) - 2;
-                    console.write(FLAnsiGrid.emit(s.grid, Math.max(1, jx), ny + gr,
+                    console.write(FLAnsiGrid.emit(face, Math.max(1, jx), ny + gr,
                         gr, 1, 0, AVATAR_W, 4));
                 }
                 s.pad = 2;
-            } else if (s.flash > 0) {
-                // Palette strobe: walk the swap maps for a few frames.
-                console.write(FLAnsiGrid.emit(s.grid, nx, ny, 0, AVATAR_H, 0, AVATAR_W,
-                    1 + ((s.flash + i) % (FLAnsiGrid.PALETTES.length - 1))));
-                s.flash--;
             } else {
-                console.write(FLAnsiGrid.emit(s.grid, nx, ny, 0, AVATAR_H, 0, AVATAR_W, 0));
+                var wx = nx;
+                if (s.wiggle > 0) {
+                    wx = nx + (s.wiggle % 2 === 0 ? 1 : -1);
+                    wx = Math.max(1, Math.min(l.cols - AVATAR_W + 1, wx));
+                    s.wiggle--;
+                    s.pad = 1;      // the shake spills a column either side
+                }
+                if (s.flash > 0) {
+                    // Palette strobe: walk the swap maps for a few frames.
+                    console.write(FLAnsiGrid.emit(face, wx, ny, 0, AVATAR_H, 0, AVATAR_W,
+                        1 + ((s.flash + i) % (FLAnsiGrid.PALETTES.length - 1))));
+                    s.flash--;
+                } else {
+                    console.write(FLAnsiGrid.emit(face, wx, ny, 0, AVATAR_H, 0, AVATAR_W, 0));
+                }
             }
             s.drawnX = nx;
             s.drawnY = ny;
@@ -1629,6 +1653,14 @@ namespace FLPlayer {
         var av = FLAnsiGrid.renderBin(bin, 10, 6);
         if (!av || av.height !== 6 || (av.rows[0][0] & 0xff) !== 65)
             throw new Error("renderBin failed");
+
+        // Horizontal mirror: cells reverse per row and directional glyphs swap.
+        var mg = FLAnsiGrid.render("/(\xDD", 3);
+        var mm = FLAnsiGrid.mirror(mg);
+        if ((mm.rows[0][0] & 0xff) !== 0xde) throw new Error("half-block not mirrored");
+        if ((mm.rows[0][1] & 0xff) !== 0x29) throw new Error("paren not mirrored");
+        if ((mm.rows[0][2] & 0xff) !== 0x5c) throw new Error("slash not mirrored");
+        if ((mm.rows[0][2] >> 8) !== (mg.rows[0][0] >> 8)) throw new Error("mirror lost attrs");
 
         // Lyrics: timed lookup walks forward and resets after a back-seek;
         // distribution spaces untimed lines evenly.

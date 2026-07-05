@@ -182,6 +182,53 @@ namespace FLAnsiGrid {
         return grid;
     }
 
+    // Horizontal mirror glyph pairs: directional CP437 characters that must
+    // swap when art is flipped across the vertical axis (half-blocks matter
+    // most for avatar art; slashes/brackets/box corners for the rest).
+    var MIRROR_PAIRS: number[][] = [
+        [0x2f, 0x5c],  // / \
+        [0x28, 0x29],  // ( )
+        [0x5b, 0x5d],  // [ ]
+        [0x7b, 0x7d],  // { }
+        [0x3c, 0x3e],  // < >
+        [0x62, 0x64],  // b d
+        [0x70, 0x71],  // p q
+        [0x11, 0x10],  // left/right triangles
+        [0xae, 0xaf],  // << >>
+        [0xdd, 0xde],  // left/right half blocks
+        [0xda, 0xbf],  // single box corners (top)
+        [0xc0, 0xd9],  // single box corners (bottom)
+        [0xc3, 0xb4],  // single box tees
+        [0xc9, 0xbb],  // double box corners (top)
+        [0xc8, 0xbc],  // double box corners (bottom)
+        [0xcc, 0xb9],  // double box tees
+        [0xd5, 0xb8], [0xd4, 0xbe], [0xd6, 0xb7], [0xd3, 0xbd],
+        [0xc6, 0xb5], [0xc7, 0xb6]
+    ];
+    var MIRROR_MAP: { [code: number]: number } = {};
+    for (var mpi = 0; mpi < MIRROR_PAIRS.length; mpi++) {
+        MIRROR_MAP[MIRROR_PAIRS[mpi][0]] = MIRROR_PAIRS[mpi][1];
+        MIRROR_MAP[MIRROR_PAIRS[mpi][1]] = MIRROR_PAIRS[mpi][0];
+    }
+
+    /** Flip a grid across the vertical axis (cells reversed per row, and
+     *  directional glyphs swapped for their mirror twins). */
+    export function mirror(grid: Grid): Grid {
+        var out: Grid = { width: grid.width, height: grid.height, rows: [] };
+        for (var y = 0; y < grid.rows.length; y++) {
+            var row = grid.rows[y];
+            var rev: number[] = [];
+            for (var x = row.length - 1; x >= 0; x--) {
+                var cell = row[x];
+                var ch = cell & 0xff;
+                var mapped = MIRROR_MAP[ch];
+                rev.push(mapped ? ((cell & 0xff00) | mapped) : cell);
+            }
+            out.rows.push(rev);
+        }
+        return out;
+    }
+
     /** Decode a 10x6 BIN avatar (char+attr pairs) into a grid. */
     export function renderBin(data: string, width: number, height: number): Grid | null {
         if (data.length < width * height * 2)

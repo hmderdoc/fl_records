@@ -944,6 +944,52 @@ var FLAnsiGrid;
         return grid;
     }
     FLAnsiGrid.render = render;
+    // Horizontal mirror glyph pairs: directional CP437 characters that must
+    // swap when art is flipped across the vertical axis (half-blocks matter
+    // most for avatar art; slashes/brackets/box corners for the rest).
+    var MIRROR_PAIRS = [
+        [0x2f, 0x5c], // / \
+        [0x28, 0x29], // ( )
+        [0x5b, 0x5d], // [ ]
+        [0x7b, 0x7d], // { }
+        [0x3c, 0x3e], // < >
+        [0x62, 0x64], // b d
+        [0x70, 0x71], // p q
+        [0x11, 0x10], // left/right triangles
+        [0xae, 0xaf], // << >>
+        [0xdd, 0xde], // left/right half blocks
+        [0xda, 0xbf], // single box corners (top)
+        [0xc0, 0xd9], // single box corners (bottom)
+        [0xc3, 0xb4], // single box tees
+        [0xc9, 0xbb], // double box corners (top)
+        [0xc8, 0xbc], // double box corners (bottom)
+        [0xcc, 0xb9], // double box tees
+        [0xd5, 0xb8], [0xd4, 0xbe], [0xd6, 0xb7], [0xd3, 0xbd],
+        [0xc6, 0xb5], [0xc7, 0xb6]
+    ];
+    var MIRROR_MAP = {};
+    for (var mpi = 0; mpi < MIRROR_PAIRS.length; mpi++) {
+        MIRROR_MAP[MIRROR_PAIRS[mpi][0]] = MIRROR_PAIRS[mpi][1];
+        MIRROR_MAP[MIRROR_PAIRS[mpi][1]] = MIRROR_PAIRS[mpi][0];
+    }
+    /** Flip a grid across the vertical axis (cells reversed per row, and
+     *  directional glyphs swapped for their mirror twins). */
+    function mirror(grid) {
+        var out = { width: grid.width, height: grid.height, rows: [] };
+        for (var y = 0; y < grid.rows.length; y++) {
+            var row = grid.rows[y];
+            var rev = [];
+            for (var x = row.length - 1; x >= 0; x--) {
+                var cell = row[x];
+                var ch = cell & 0xff;
+                var mapped = MIRROR_MAP[ch];
+                rev.push(mapped ? ((cell & 0xff00) | mapped) : cell);
+            }
+            out.rows.push(rev);
+        }
+        return out;
+    }
+    FLAnsiGrid.mirror = mirror;
     /** Decode a 10x6 BIN avatar (char+attr pairs) into a grid. */
     function renderBin(data, width, height) {
         if (data.length < width * height * 2)
@@ -1805,6 +1851,8 @@ var FLPlayer;
                 continue;
             sprites.push({
                 grid: grid,
+                flipped: FLAnsiGrid.mirror(grid),
+                facing: (i % 2 === 0) ? 1 : -1,
                 x: i === 0 ? 3 : Math.max(3, zoneW - AVATAR_W - 2),
                 y: l.artTop + 1 + i * 2,
                 vx: (i % 2 === 0 ? 1 : -1) * 0.9,
@@ -1814,6 +1862,7 @@ var FLPlayer;
                 trail: i % TRAIL_COLORS.length,
                 flash: 0,
                 glitch: 0,
+                wiggle: 0,
                 pad: 0
             });
         }
@@ -1841,6 +1890,15 @@ var FLPlayer;
                 // Hard accent: glitch out — jittered rows in scramble colors.
                 s.glitch = 3;
             }
+            else if (beat && s.wiggle === 0 && Math.random() < 0.35) {
+                // Some beats: a quick side-to-side head shake.
+                s.wiggle = 4;
+            }
+            // Face the direction of travel (flips on bounces + collisions).
+            if (s.vx > 0.15)
+                s.facing = 1;
+            else if (s.vx < -0.15)
+                s.facing = -1;
             // Clamp velocity so a pile of beats can't launch them.
             s.vx = clamp(s.vx, -1.6, 1.6);
             s.vy = clamp(s.vy, -1.1, 1.1);
@@ -1896,7 +1954,7 @@ var FLPlayer;
             var nx = Math.round(s.x);
             var ny = Math.round(s.y);
             var moved = nx !== s.drawnX || ny !== s.drawnY;
-            var animating = s.flash > 0 || s.glitch > 0 || s.pad > 0;
+            var animating = s.flash > 0 || s.glitch > 0 || s.wiggle > 0 || s.pad > 0;
             if (!force && !moved && !animating)
                 continue;
             if (s.drawnX >= 0 && (moved || s.pad > 0)) {
@@ -1905,6 +1963,7 @@ var FLPlayer;
                 restoreRect(blit, l, s.drawnX - s.pad, s.drawnY, AVATAR_W + s.pad * 2, AVATAR_H, moved ? TRAIL_COLORS[s.trail] : undefined);
             }
             s.pad = 0;
+            var face = s.facing < 0 ? s.flipped : s.grid;
             if (s.glitch > 0) {
                 // Glitch-out: each row lands with its own horizontal jitter,
                 // drawn through the scramble palette (and one dropped row).
@@ -1914,17 +1973,26 @@ var FLPlayer;
                     if (gr === dropRow)
                         continue;
                     var jx = nx + Math.floor(Math.random() * 5) - 2;
-                    console.write(FLAnsiGrid.emit(s.grid, Math.max(1, jx), ny + gr, gr, 1, 0, AVATAR_W, 4));
+                    console.write(FLAnsiGrid.emit(face, Math.max(1, jx), ny + gr, gr, 1, 0, AVATAR_W, 4));
                 }
                 s.pad = 2;
             }
-            else if (s.flash > 0) {
-                // Palette strobe: walk the swap maps for a few frames.
-                console.write(FLAnsiGrid.emit(s.grid, nx, ny, 0, AVATAR_H, 0, AVATAR_W, 1 + ((s.flash + i) % (FLAnsiGrid.PALETTES.length - 1))));
-                s.flash--;
-            }
             else {
-                console.write(FLAnsiGrid.emit(s.grid, nx, ny, 0, AVATAR_H, 0, AVATAR_W, 0));
+                var wx = nx;
+                if (s.wiggle > 0) {
+                    wx = nx + (s.wiggle % 2 === 0 ? 1 : -1);
+                    wx = Math.max(1, Math.min(l.cols - AVATAR_W + 1, wx));
+                    s.wiggle--;
+                    s.pad = 1; // the shake spills a column either side
+                }
+                if (s.flash > 0) {
+                    // Palette strobe: walk the swap maps for a few frames.
+                    console.write(FLAnsiGrid.emit(face, wx, ny, 0, AVATAR_H, 0, AVATAR_W, 1 + ((s.flash + i) % (FLAnsiGrid.PALETTES.length - 1))));
+                    s.flash--;
+                }
+                else {
+                    console.write(FLAnsiGrid.emit(face, wx, ny, 0, AVATAR_H, 0, AVATAR_W, 0));
+                }
             }
             s.drawnX = nx;
             s.drawnY = ny;
@@ -2517,6 +2585,17 @@ var FLPlayer;
         var av = FLAnsiGrid.renderBin(bin, 10, 6);
         if (!av || av.height !== 6 || (av.rows[0][0] & 0xff) !== 65)
             throw new Error("renderBin failed");
+        // Horizontal mirror: cells reverse per row and directional glyphs swap.
+        var mg = FLAnsiGrid.render("/(\xDD", 3);
+        var mm = FLAnsiGrid.mirror(mg);
+        if ((mm.rows[0][0] & 0xff) !== 0xde)
+            throw new Error("half-block not mirrored");
+        if ((mm.rows[0][1] & 0xff) !== 0x29)
+            throw new Error("paren not mirrored");
+        if ((mm.rows[0][2] & 0xff) !== 0x5c)
+            throw new Error("slash not mirrored");
+        if ((mm.rows[0][2] >> 8) !== (mg.rows[0][0] >> 8))
+            throw new Error("mirror lost attrs");
         // Lyrics: timed lookup walks forward and resets after a back-seek;
         // distribution spaces untimed lines evenly.
         var ly = [{ time: 5, text: "one" }, { time: 10, text: "two" }, { time: 20, text: "three" }];
