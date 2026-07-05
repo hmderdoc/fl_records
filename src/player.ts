@@ -1091,6 +1091,8 @@ namespace FLPlayer {
         var lastProbeAt = 0;
         var lastConsoleCols = console.screen_columns || 0;
         var lastConsoleRows = console.screen_rows || 0;
+        var cprSeen = 0;              // resize diagnostics (corner readout)
+        var relayouts = 0;
         // Onset + energy tracking (all on RAW rms, updated once per chunk):
         // emaFast (~1s) is the local level — a chunk jumping clearly above it
         // is a beat/accent, even mid-plateau. emaSlow (~6s) is the passage
@@ -1160,6 +1162,7 @@ namespace FLPlayer {
                 return;
             termCols = cols;
             termRows = rows;
+            relayouts++;
             l = layout(termCols, termRows);
             blit = makeArtBlit(track, l);
             margins = marginRects(l, blit);
@@ -1333,8 +1336,10 @@ namespace FLPlayer {
                 lastConsoleRows = conR;
                 relayout(conC, conR);
             }
-            for (var cp = 0; cp < ev.cpr.length; cp++)
+            for (var cp = 0; cp < ev.cpr.length; cp++) {
+                cprSeen++;
                 relayout(ev.cpr[cp][1], ev.cpr[cp][0]);
+            }
             if (now - lastProbeAt >= 2000) {
                 lastProbeAt = now;
                 console.write("\x1b7\x1b[999;999H\x1b[6n\x1b8");
@@ -1503,6 +1508,9 @@ namespace FLPlayer {
                     drawHints(l);
 
                 drawProgress(l, clamp(playMs / 1000, 0, totalSec), totalSec, paused, volumePct);
+                var diag = l.cols + "x" + l.rows + " c" + cprSeen + " r" + relayouts;
+                console.write(gotoRC(l.rows, Math.max(1, l.cols - diag.length)) +
+                    sgr("0;30;1") + diag + CLR);
                 console.write(gotoRC(l.rows, l.cols) + CLR);
             }
         }
