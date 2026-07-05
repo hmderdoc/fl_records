@@ -325,6 +325,19 @@ namespace FLPlayer {
         }
     }
 
+    // The ONE input pump. Detection, playback, and the between-tracks window
+    // must all read through the same buffer: separate pump instances bisected
+    // CSI replies at their hand-off boundaries (one pump holds "\x1b[=7;2",
+    // the next reads ";0n" as plain chars — and that trailing 'n' was a
+    // phantom [N]ext). A partial held here completes on the next pump call,
+    // no matter which phase makes it.
+    var sharedPump = new InputPump();
+
+    /** Pump input through the shared buffer (for inter-track windows). */
+    export function pumpShared(maxMs: number): PumpResult {
+        return sharedPump.pump(maxMs);
+    }
+
     // ---- sink detection ---------------------------------------------------
     /**
      * Two-stage probe:
@@ -336,7 +349,7 @@ namespace FLPlayer {
     export function detectSink(force?: boolean): SinkKind {
         if (detectedSink !== null && !force)
             return detectedSink;
-        var pumpr = new InputPump();
+        var pumpr = sharedPump;
         var found: SinkKind = "none";
 
         apc("Q;libsndfile");
@@ -1115,7 +1128,7 @@ namespace FLPlayer {
         var termCols = 0;             // 0 = trust console.screen_*
         var termRows = 0;
         var l = layout();
-        var pump = new InputPump();
+        var pump = sharedPump;
         var visMode = 0;
         var bgMode = 0;               // BG_MODES index
         var volumePct = 80;

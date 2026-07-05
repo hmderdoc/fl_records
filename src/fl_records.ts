@@ -1320,7 +1320,6 @@ interface AppState {
             console.writeln("Audio sink: " + (sink === "syncterm" ? "SyncTERM (libsndfile)" : "APC bridge"));
 
             var idx = typeof index === "number" ? index : 0;
-            var transitionPump = new FLPlayer.InputPump();
             while (bbs.online && !js.terminated) {
                 var cur = (list && list.length) ? list[idx] : track;
                 // Immediate feedback for the inter-track gap (tag parse +
@@ -1366,7 +1365,7 @@ interface AppState {
                 // down / the next track was loading: Q still quits, and
                 // buffered N/P adjust how far we move — no more sailing past
                 // the track you wanted.
-                var buffered = transitionPump.pump(80);
+                var buffered = FLPlayer.pumpShared(80);
                 var extra = 0;
                 var quitBuffered = buffered.esc;
                 for (var bi = 0; bi < buffered.keys.length; bi++) {

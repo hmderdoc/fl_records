@@ -1333,6 +1333,18 @@ var FLPlayer;
         return InputPump;
     }());
     FLPlayer.InputPump = InputPump;
+    // The ONE input pump. Detection, playback, and the between-tracks window
+    // must all read through the same buffer: separate pump instances bisected
+    // CSI replies at their hand-off boundaries (one pump holds "\x1b[=7;2",
+    // the next reads ";0n" as plain chars — and that trailing 'n' was a
+    // phantom [N]ext). A partial held here completes on the next pump call,
+    // no matter which phase makes it.
+    var sharedPump = new InputPump();
+    /** Pump input through the shared buffer (for inter-track windows). */
+    function pumpShared(maxMs) {
+        return sharedPump.pump(maxMs);
+    }
+    FLPlayer.pumpShared = pumpShared;
     // ---- sink detection ---------------------------------------------------
     /**
      * Two-stage probe:
@@ -1344,7 +1356,7 @@ var FLPlayer;
     function detectSink(force) {
         if (detectedSink !== null && !force)
             return detectedSink;
-        var pumpr = new InputPump();
+        var pumpr = sharedPump;
         var found = "none";
         apc("Q;libsndfile");
         var deadline = nowMs() + 700;
@@ -2050,7 +2062,7 @@ var FLPlayer;
         var termCols = 0; // 0 = trust console.screen_*
         var termRows = 0;
         var l = layout();
-        var pump = new InputPump();
+        var pump = sharedPump;
         var visMode = 0;
         var bgMode = 0; // BG_MODES index
         var volumePct = 80;
@@ -3967,7 +3979,6 @@ var FLPlayer;
             }
             console.writeln("Audio sink: " + (sink === "syncterm" ? "SyncTERM (libsndfile)" : "APC bridge"));
             var idx = typeof index === "number" ? index : 0;
-            var transitionPump = new FLPlayer.InputPump();
             while (bbs.online && !js.terminated) {
                 var cur = (list && list.length) ? list[idx] : track;
                 // Immediate feedback for the inter-track gap (tag parse +
@@ -4014,7 +4025,7 @@ var FLPlayer;
                 // down / the next track was loading: Q still quits, and
                 // buffered N/P adjust how far we move — no more sailing past
                 // the track you wanted.
-                var buffered = transitionPump.pump(80);
+                var buffered = FLPlayer.pumpShared(80);
                 var extra = 0;
                 var quitBuffered = buffered.esc;
                 for (var bi = 0; bi < buffered.keys.length; bi++) {
