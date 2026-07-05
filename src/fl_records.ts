@@ -125,6 +125,9 @@ interface AppState {
     var DIR_CODE = "originalcontent_mp3s";
     var CHAT_CHANNEL = "main";
     var CACHE_VERSION = 2;
+    // Sentinel returned by uifc.list when a caller-defined hotkey is pressed
+    // (distinct from a row index >= 0 and from Esc's -1).
+    var UI_ACTION_DETAIL = -2;
     var CACHE_FILE = "catalog-cache.json";
 
     var uiReady = false;
@@ -1515,13 +1518,20 @@ interface AppState {
             } else {
                 options = options.concat(filtered.map(trackRow));
             }
-            uifc.help_text = "The first row edits filters. Select any song row to open its detail view.";
+            uifc.help_text = "Enter plays the song in the terminal.  T opens its details.  First row edits filters.";
+            (app.trackListCtx as any).actionKeys = { "T": UI_ACTION_DETAIL };
             selection = uifc.list(
                 WIN_ESC | WIN_SAV | WIN_ACT,
-                "Read / Listen  (" + filtered.length + " of " + app.catalog.length + " tracks)",
+                "All Songs  (" + filtered.length + " of " + app.catalog.length + " tracks)",
                 options,
                 app.trackListCtx
             );
+            if (selection === UI_ACTION_DETAIL) {
+                var drow = (app.trackListCtx as any).cur;
+                if (filtered.length && drow >= 2 && drow - 2 < filtered.length)
+                    showTrackDetail(filtered[drow - 2], filtered, drow - 2);
+                continue;
+            }
             if (selection < 0) return;
             if (selection === 0) {
                 editTrackFilters(app);
@@ -1532,7 +1542,9 @@ interface AppState {
                 continue;
             }
             if (!filtered.length) continue;
-            showTrackDetail(filtered[selection - 2], filtered, selection - 2);
+            // Enter drops straight into the in-terminal player/visualizer; the
+            // detail view is one T away for full metadata/art/lyrics.
+            playInTerminal(filtered[selection - 2], filtered, selection - 2);
         }
     }
 
@@ -2124,27 +2136,41 @@ interface AppState {
         }
     }
 
+    function comingSoonPlaylists(): void {
+        uifc.msg([
+            "Playlists arrive in the next update.",
+            "",
+            "Playlists you build on the web are saved in your",
+            "browser, so the door can't read them yet. The next",
+            "version adds a shared playlist store the web player",
+            "and the BBS both use."
+        ].join("\n"));
+    }
+
     function mainMenu(app: AppState): void {
         var choice: number;
         while (bbs.online && !js.terminated) {
-            uifc.help_text = "Read / Listen opens the filterable song list. Create / Compose builds a Vektrax prompt in a grouped terminal workflow.";
+            uifc.help_text = "All Songs browses and plays the catalog. Create Song builds a prompt for Vektrax.";
             choice = uifc.list(
                 WIN_ESC | WIN_SAV | WIN_ACT,
                 APP_TITLE,
                 [
-                    "Read / Listen      " + app.catalog.length + " tracks",
-                    "Create / Compose",
+                    "All Songs          " + app.catalog.length + " tracks",
+                    "Select Playlist    (coming soon)",
+                    "Create Song",
                     "Refresh Catalog Cache",
                     "Quit"
                 ],
                 app.mainMenuCtx
             );
-            if (choice < 0 || choice === 3) return;
+            if (choice < 0 || choice === 4) return;
             if (choice === 0) {
                 browseTracks(app);
             } else if (choice === 1) {
-                composeMenu(app);
+                comingSoonPlaylists();
             } else if (choice === 2) {
+                composeMenu(app);
+            } else if (choice === 3) {
                 app.catalog = loadCatalog(true);
             }
         }

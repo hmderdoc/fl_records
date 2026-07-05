@@ -139,6 +139,13 @@ namespace FLUifcShim {
             } else if (k === ESC || k === "q" || k === "Q") {
                 if (ctx) ctx.cur = cur;
                 return -1;
+            } else if (ctx && ctx.actionKeys && k &&
+                ctx.actionKeys[k.toUpperCase()] !== undefined) {
+                // Caller-defined hotkey: remember the row and return its
+                // sentinel so the caller can act on the highlighted item
+                // (e.g. "T" opens track details from the song list).
+                ctx.cur = cur;
+                return ctx.actionKeys[k.toUpperCase()];
             }
             if (cur < top) top = cur;
             if (cur >= top + visible) top = cur - visible + 1;
