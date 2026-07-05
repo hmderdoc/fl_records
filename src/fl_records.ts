@@ -1451,8 +1451,15 @@ interface AppState {
                     continue;
                 }
                 if (outcome === "create") {
-                    // Compose is a uifc flow; bring the UI up just for it, then
-                    // drop back to the console-mode player.
+                    // Compose is a uifc flow, and the shim reads via
+                    // console.getkey which (unlike the pump) does NOT swallow
+                    // APC replies. The player's exit flush fades ~250ms then
+                    // emits a drain notify whose ESC would dismiss the menu the
+                    // instant it opens -- so drain past it here before uifc.
+                    console.clear();
+                    console.writeln("");
+                    console.writeln("  Opening composer...");
+                    FLPlayer.pumpShared(450);
                     initUi();
                     composeMenu(activeApp);
                     safeBailUi();

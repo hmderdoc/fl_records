@@ -1121,7 +1121,6 @@ var FLPlayer;
     var PCM_CHANNELS = 2; // stereo; halve bandwidth with 1 if needed
     var UI_TICK_MS = 150; // overlay/visualizer repaint cadence
     var SEEK_SECONDS = 10;
-    var VOLUME_STEP = 10; // percent per Up/Down press
     // Synchronet's console.inkey() COOKS recognized cursor keys into single
     // control bytes (see key_defs.js) rather than passing the raw ESC[ sequence,
     // so real arrow presses never reach the ESC-sequence decoder below. Map the
@@ -1720,10 +1719,10 @@ var FLPlayer;
         console.write(gotoRC(l.boxTop + 1, l.boxLeft + 2) +
             sgr("1;36") + label + repeatByte(" ", inner - label.length) + CLR);
     }
-    function drawProgress(l, playedSec, totalSec, paused, volumePct) {
+    function drawProgress(l, playedSec, totalSec, paused) {
         var inner = l.boxWidth - 4;
         var timeTxt = fmtTime(playedSec) + "/" + fmtTime(totalSec);
-        var volTxt = paused ? " PAUSED " : (" vol" + volumePct + " ");
+        var volTxt = paused ? " PAUSED " : "";
         var barWidth = inner - timeTxt.length - volTxt.length - 2;
         if (barWidth < 8) {
             volTxt = "";
@@ -1738,11 +1737,11 @@ var FLPlayer;
     function drawHints(l) {
         // ASCII only: CP437 arrow glyphs live at C0 control positions (0x1B is
         // ESC!) and cannot be sent raw without corrupting the terminal state.
-        var hints = "[Space]Pause  [+/-]Vol  [N/P]Track  [B]rowse  [C]reate  [Q]uit";
+        var hints = "[Space]Pause   [N/P]Track   [B]rowse   [C]reate   [Q]uit";
         if (hints.length > l.boxWidth)
-            hints = "[Spc]Pse [+/-]Vol [N/P]Trk [B]rowse [Q]uit";
+            hints = "[Spc]Pse [N/P]Trk [B]rowse [C]reate [Q]uit";
         if (hints.length > l.boxWidth)
-            hints = "[Spc][+/-][N/P][B][Q]";
+            hints = "[Spc][N/P][B][C][Q]";
         var col = Math.max(1, l.boxLeft + Math.floor((l.boxWidth - hints.length) / 2));
         console.write(gotoRC(Math.min(l.rows, l.boxTop + 4), col) + sgr("0;30;1") + hints + CLR);
     }
@@ -2202,7 +2201,6 @@ var FLPlayer;
         var pump = sharedPump;
         var visMode = 0;
         var bgMode = 0; // BG_MODES index
-        var volumePct = 80;
         var borderPulse = 0; // decaying beat flash
         var lastRms = 0;
         var artFlashAt = 0;
@@ -2297,12 +2295,6 @@ var FLPlayer;
             rings = [];
             redrawAll();
         }
-        function setVolume(pct) {
-            volumePct = clamp(pct, 0, 100);
-            // ;T ramps smoothly; the on-screen "vol" indicator refreshes on the
-            // next UI tick. Canonical APC volume is 0-100 linear percent.
-            apc("A;Volume;C=" + CHANNEL + ";V=" + volumePct + ";T=120");
-        }
         // Drop input that leaked in before this track took the keyboard
         // (auto-repeat dregs; buffered intent was already honored by the
         // caller between tracks). This MUST go through the pump, not raw
@@ -2312,7 +2304,6 @@ var FLPlayer;
         // pump reassembles sequences and keeps partials buffered instead.
         pump.pump(40);
         redrawAll();
-        apc("A;Volume;C=" + CHANNEL + ";V=" + volumePct);
         apc("A;Update;C=" + CHANNEL);
         var chunk = 0; // next chunk to emit
         var t0 = nowMs(); // wall-clock anchor: chunk i plays at t0 + i*CHUNK_MS
@@ -2411,27 +2402,17 @@ var FLPlayer;
                     result = "create"; // jump to the compose-a-song flow
                     quitReq = true;
                 }
-                else if (k === "+" || k === "=") {
-                    setVolume(volumePct + VOLUME_STEP);
-                }
-                else if (k === "-" || k === "_") {
-                    setVolume(volumePct - VOLUME_STEP);
-                }
             }
             for (var a = 0; a < ev.arrows.length; a++) {
                 var dir = ev.arrows[a];
-                // Arrows mirror the reliable keys: Up/Dn volume, Left/Right track.
-                if (dir === "up") {
-                    setVolume(volumePct + VOLUME_STEP);
-                }
-                else if (dir === "down") {
-                    setVolume(volumePct - VOLUME_STEP);
-                }
-                else if (dir === "left") {
+                // Any arrow skips tracks. No in-terminal volume: SyncTERM's
+                // per-channel gain scratches mid-stream and doesn't take, so
+                // volume is left to the OS/terminal mixer.
+                if (dir === "up" || dir === "left") {
                     result = "prev";
                     quitReq = true;
                 }
-                else if (dir === "right") {
+                else if (dir === "down" || dir === "right") {
                     result = "next";
                     quitReq = true;
                 }
@@ -2652,7 +2633,7 @@ var FLPlayer;
                 }
                 if (bgPainted)
                     drawHints(l);
-                drawProgress(l, clamp(playMs / 1000, 0, totalSec), totalSec, paused, volumePct);
+                drawProgress(l, clamp(playMs / 1000, 0, totalSec), totalSec, paused);
                 var diag = l.cols + "x" + l.rows + " c" + cprSeen + " r" + relayouts;
                 console.write(gotoRC(l.rows, Math.max(1, l.cols - diag.length)) +
                     sgr("0;30;1") + diag + CLR);
@@ -4336,8 +4317,15 @@ var FLPlayer;
                     continue;
                 }
                 if (outcome === "create") {
-                    // Compose is a uifc flow; bring the UI up just for it, then
-                    // drop back to the console-mode player.
+                    // Compose is a uifc flow, and the shim reads via
+                    // console.getkey which (unlike the pump) does NOT swallow
+                    // APC replies. The player's exit flush fades ~250ms then
+                    // emits a drain notify whose ESC would dismiss the menu the
+                    // instant it opens -- so drain past it here before uifc.
+                    console.clear();
+                    console.writeln("");
+                    console.writeln("  Opening composer...");
+                    FLPlayer.pumpShared(450);
                     initUi();
                     composeMenu(activeApp);
                     safeBailUi();
