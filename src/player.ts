@@ -42,6 +42,14 @@
 
 namespace FLPlayer {
 
+    // Self-provide the sbbsdefs constants (K_NONE etc). Synchronet's load()
+    // executes into the CALLER'S scope: the door's IIFE loading sbbsdefs does
+    // not make the constants visible out here — that only appeared to work
+    // when an outer shell had already loaded them globally (ssh sessions via
+    // future_shell). Fresh contexts (webv4 fTelnet path) crashed with
+    // "K_NONE is not defined".
+    load("sbbsdefs.js");
+
     // ---- tuning -------------------------------------------------------
     var CHUNK_MS = 300;          // clip length; also the pacing quantum
     var PREBUFFER = 3;           // chunks queued ahead of realtime

@@ -14,6 +14,11 @@
 
 namespace FLUifcShim {
 
+    // Self-provide sbbsdefs constants (K_NONE/K_EDIT/K_LINE): load() scopes
+    // to the caller, so the door IIFE's own load is invisible here. See the
+    // matching note in player.ts.
+    load("sbbsdefs.js");
+
     var ESC = "\x1b";
 
     function scrCols(): number {
