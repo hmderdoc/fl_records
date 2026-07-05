@@ -608,15 +608,23 @@ namespace FLPlayer {
         boxWidth: number;
         glowRow1: number;  // strip above the lyric line
         lyricRow: number;
+        lyricLeft: number; // lyric strip can be WIDER than the box on wide
+        lyricWidth: number;// terminals with long lines (never narrower)
         glowRow2: number;  // strip below the lyric line
         artTop: number;    // art window: rows artTop .. artBottom (inclusive)
         artBottom: number;
     }
 
-    function layout(termCols?: number, termRows?: number): Layout {
+    // maxLyricLen (a track's longest line) lets the lyric strip grow past the
+    // box on a wide terminal so long lines aren't ellipsized -- computed once
+    // per track so the width is stable across lines, never shrinking the box.
+    function layout(termCols?: number, termRows?: number, maxLyricLen?: number): Layout {
         var cols = Math.max(40, termCols || console.screen_columns || 80);
         var rows = Math.max(14, termRows || console.screen_rows || 24);
         var width = Math.min(cols - 2, 76);
+        var lyricW = width;
+        if (maxLyricLen && maxLyricLen + 2 > width)
+            lyricW = Math.min(cols - 2, maxLyricLen + 2);
         return {
             cols: cols,
             rows: rows,
@@ -625,6 +633,8 @@ namespace FLPlayer {
             boxWidth: width,
             glowRow1: rows - 7,
             lyricRow: rows - 6,
+            lyricLeft: Math.max(1, Math.floor((cols - lyricW) / 2) + 1),
+            lyricWidth: lyricW,
             glowRow2: rows - 5,
             artTop: 1,
             artBottom: rows - 8
@@ -862,11 +872,11 @@ namespace FLPlayer {
     var LYRIC_SWEEP_MS = 1500;
 
     function drawLyric(l: Layout, text: string, colorIdx: number, progress: number): void {
-        var t = text.length > l.boxWidth - 2 ? text.substr(0, l.boxWidth - 5) + "..." : text;
-        var pad = l.boxWidth - t.length;
+        var t = text.length > l.lyricWidth - 2 ? text.substr(0, l.lyricWidth - 5) + "..." : text;
+        var pad = l.lyricWidth - t.length;
         var lead = Math.floor(pad / 2);
         var pair = LYRIC_COLORS[colorIdx % LYRIC_COLORS.length];
-        var out = gotoRC(l.lyricRow, l.boxLeft) + bgFillRun(l.boxLeft, l.lyricRow, lead);
+        var out = gotoRC(l.lyricRow, l.lyricLeft) + bgFillRun(l.lyricLeft, l.lyricRow, lead);
         if (progress >= 1 || !t.length) {
             out += sgr(pair[1]) + t;
         } else {
@@ -885,7 +895,7 @@ namespace FLPlayer {
             }
         }
         console.write(out + CLR +
-            bgFillRun(l.boxLeft + lead + t.length, l.lyricRow, pad - lead));
+            bgFillRun(l.lyricLeft + lead + t.length, l.lyricRow, pad - lead));
     }
 
     // ---- background effects in the art margins --------------------------------
@@ -1363,6 +1373,15 @@ namespace FLPlayer {
         var lyrics: LyricLine[] = track.lyrics && track.lyrics.length
             ? track.lyrics
             : distributeLyrics(track.flatLyrics || "", totalSec);
+        // Size the lyric strip to this track's longest line so a wide terminal
+        // shows full lines instead of ellipsis. Per track (stable across lines),
+        // never narrower than the box; the glow/viz bars keep the box width.
+        var maxLyricLen = 0;
+        for (var mli = 0; mli < lyrics.length; mli++) {
+            var llen = lyrics[mli] && lyrics[mli].text ? lyrics[mli].text.length : 0;
+            if (llen > maxLyricLen) maxLyricLen = llen;
+        }
+        l = layout(l.cols, l.rows, maxLyricLen);
         var lyricIdx = -1;
         var lyricColor = Math.floor(Math.random() * 6);
         var lyricSweepAt = 0;         // 0 = steady (no sweep running)
@@ -1390,7 +1409,7 @@ namespace FLPlayer {
             termCols = cols;
             termRows = rows;
             relayouts++;
-            l = layout(termCols, termRows);
+            l = layout(termCols, termRows, maxLyricLen);
             blit = makeArtBlit(track, l);
             margins = marginRects(l, blit);
             lyricIdx = -1;      // repaint the lyric row after the redraw
@@ -1980,8 +1999,14 @@ namespace FLPlayer {
         // the box span itself.
         var fakeL: Layout = {
             cols: 120, rows: 40, boxTop: 36, boxLeft: 23, boxWidth: 76,
-            glowRow1: 33, lyricRow: 34, glowRow2: 35, artTop: 1, artBottom: 32
+            glowRow1: 33, lyricRow: 34, lyricLeft: 23, lyricWidth: 76,
+            glowRow2: 35, artTop: 1, artBottom: 32
         };
+        // Lyric strip grows past the box on a wide terminal with long lines,
+        // but never below the box width, and stays capped at cols-2.
+        if (layout(120, 40, 100).lyricWidth !== 102) throw new Error("lyric grow");
+        if (layout(120, 40, 40).lyricWidth !== 76) throw new Error("lyric no-shrink");
+        if (layout(80, 40, 200).lyricWidth !== 78) throw new Error("lyric cap to cols");
         var fakeBlit: ArtBlit = {
             grid: { width: 80, height: 30, rows: [] }, left: 21, top: 2,
             srcRow: 0, srcCol: 0, nRows: 30, nCols: 80, pal: 0
