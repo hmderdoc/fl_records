@@ -1240,7 +1240,7 @@ var FLPlayer;
         }
         /** Poll for up to maxMs, decoding everything that arrives. */
         InputPump.prototype.pump = function (maxMs) {
-            var res = { keys: [], arrows: [], esc: false, audio: [], cpr: [] };
+            var res = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
             var deadline = nowMs() + maxMs;
             do {
                 var k = console.inkey(K_NONE, 10);
@@ -1327,12 +1327,52 @@ var FLPlayer;
                 else if (fin === "D") {
                     res.arrows.push("left");
                 }
-                // other CSI (mouse, reports): ignored
+                else {
+                    // Unhandled CSI: recorded so diagnostics can see what a
+                    // terminal is REALLY sending (kitty-mode keys, mouse...).
+                    res.other.push("[" + body + fin);
+                }
             }
         };
         return InputPump;
     }());
     FLPlayer.InputPump = InputPump;
+    // ---- flight recorder (armed by data/player-debug.on) -------------------
+    var dbgChecked = false;
+    var dbgOn = false;
+    function dbg(line) {
+        if (!dbgChecked) {
+            dbgChecked = true;
+            dbgOn = file_exists(backslash(js.exec_dir) + "data/player-debug.on");
+        }
+        if (!dbgOn)
+            return;
+        try {
+            var f = new File(backslash(js.exec_dir) + "data/player-debug.log");
+            if (f.open("a")) {
+                f.writeln(new Date().getTime() + " " + line);
+                f.close();
+            }
+        }
+        catch (e) { }
+    }
+    FLPlayer.dbg = dbg;
+    function fmtPump(ev) {
+        var bits = [];
+        if (ev.keys.length)
+            bits.push("keys=" + ev.keys.join(""));
+        if (ev.arrows.length)
+            bits.push("arrows=" + ev.arrows.join(","));
+        if (ev.esc)
+            bits.push("ESC");
+        for (var i = 0; i < ev.audio.length; i++)
+            bits.push("audio=" + ev.audio[i][0] + ":" + ev.audio[i][1]);
+        for (var c = 0; c < ev.cpr.length; c++)
+            bits.push("cpr=" + ev.cpr[c][0] + "x" + ev.cpr[c][1]);
+        for (var o = 0; o < ev.other.length; o++)
+            bits.push("other=^" + ev.other[o]);
+        return bits.join(" ");
+    }
     // The ONE input pump. Detection, playback, and the between-tracks window
     // must all read through the same buffer: separate pump instances bisected
     // CSI replies at their hand-off boundaries (one pump holds "\x1b[=7;2",
@@ -2205,6 +2245,7 @@ var FLPlayer;
             apc("A;Flush;C=" + CHANNEL);
             apc("A;Update;C=" + CHANNEL);
         }
+        dbg("playLoop start: " + track.name + " chunks=" + totalChunks);
         while (bbs.online && !js.terminated) {
             var now = nowMs();
             var playMs = paused ? pausedMs : (now - t0);
@@ -2221,6 +2262,8 @@ var FLPlayer;
             }
             // ---- input + audio events ----
             var ev = pump.pump(20);
+            if (ev.keys.length || ev.arrows.length || ev.esc || ev.audio.length || ev.other.length)
+                dbg("pump: " + fmtPump(ev) + " @chunk " + playChunk + "/" + totalChunks);
             var quitReq = ev.esc;
             if (ev.esc)
                 result = "quit"; // Esc means leave, not "song ended"
@@ -2299,6 +2342,7 @@ var FLPlayer;
                         quitReq = true;
                     }
                     else if (now - lastFlushAt < FLUSH_GRACE_MS) {
+                        dbg("notify: stale (grace), re-armed");
                         // Stale echo of our own Flush (seek/pause/track start):
                         // the one-shot was consumed by it, so just re-arm and
                         // keep playing. Recovering here would re-Flush and
@@ -2308,6 +2352,7 @@ var FLPlayer;
                     else {
                         // Underrun: the cushion ran dry (slow link / stall).
                         // Re-anchor and re-prime, exactly like lameboy does.
+                        dbg("notify: underrun re-prime @" + playChunk);
                         rePrime(playChunk);
                     }
                 }
@@ -2513,6 +2558,7 @@ var FLPlayer;
             }
         }
         apc("A;Flush;C=" + CHANNEL + ";O=250");
+        dbg("playLoop exit: result=" + result);
         return result;
     }
     // ---- self test (jsexec, headless) ----------------------------------------
@@ -2632,7 +2678,7 @@ var FLPlayer;
             throw new Error("base64 round trip failed");
         // Reply parser: feature reply, drain notify, arrows, keys, lone ESC.
         var p = new InputPump();
-        var res = { keys: [], arrows: [], esc: false, audio: [], cpr: [] };
+        var res = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
         p.buf = "\x1b[=7;100;1nq\x1b[C\x1b[=7;2;0n\x1b";
         p.drain(res, true);
         if (res.audio.length !== 2)
@@ -2655,7 +2701,7 @@ var FLPlayer;
         // The killer case: an audio notify split right after its ESC byte
         // must NOT become Esc + plain chars (the phantom 'N' bug).
         var pSplit = new InputPump();
-        var rSplit = { keys: [], arrows: [], esc: false, audio: [], cpr: [] };
+        var rSplit = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
         pSplit.buf = "\x1b";
         pSplit.drain(rSplit, true); // pump boundary hits mid-sequence
         pSplit.buf += "[=7;2;0n"; // the rest arrives next pump
@@ -2667,7 +2713,7 @@ var FLPlayer;
         if (rSplit.audio.length !== 1 || rSplit.audio[0][0] !== 2 || rSplit.audio[0][1] !== 0)
             throw new Error("split notify not reassembled");
         var p3 = new InputPump();
-        var r3 = { keys: [], arrows: [], esc: false, audio: [], cpr: [] };
+        var r3 = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
         p3.buf = "\x1b[74;162R";
         p3.drain(r3, true);
         if (r3.cpr.length !== 1 || r3.cpr[0][0] !== 74 || r3.cpr[0][1] !== 162)
@@ -2683,7 +2729,7 @@ var FLPlayer;
         }
         // Split CSI across feeds must not produce phantom keys.
         var p2 = new InputPump();
-        var r2 = { keys: [], arrows: [], esc: false, audio: [], cpr: [] };
+        var r2 = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
         p2.buf = "\x1b[=7;2";
         p2.drain(r2, false);
         if (r2.keys.length || r2.audio.length || r2.esc)
@@ -4026,6 +4072,9 @@ var FLPlayer;
                 // buffered N/P adjust how far we move — no more sailing past
                 // the track you wanted.
                 var buffered = FLPlayer.pumpShared(80);
+                FLPlayer.dbg("transition: outcome=" + outcome + " idx=" + idx +
+                    (buffered.keys.length ? " buffered=" + buffered.keys.join("") : "") +
+                    (buffered.esc ? " bufferedESC" : ""));
                 var extra = 0;
                 var quitBuffered = buffered.esc;
                 for (var bi = 0; bi < buffered.keys.length; bi++) {
@@ -4047,6 +4096,7 @@ var FLPlayer;
                     if (target >= list.length)
                         return;
                     idx = target < 0 ? 0 : target;
+                    FLPlayer.dbg("advance -> idx=" + idx);
                     continue;
                 }
                 if (outcome === "prev") {
@@ -4054,6 +4104,7 @@ var FLPlayer;
                         return;
                     var back = idx - 1 + extra;
                     idx = back < 0 ? 0 : (back >= list.length ? list.length - 1 : back);
+                    FLPlayer.dbg("back -> idx=" + idx);
                     continue;
                 }
                 return;

@@ -1366,6 +1366,9 @@ interface AppState {
                 // buffered N/P adjust how far we move — no more sailing past
                 // the track you wanted.
                 var buffered = FLPlayer.pumpShared(80);
+                FLPlayer.dbg("transition: outcome=" + outcome + " idx=" + idx +
+                    (buffered.keys.length ? " buffered=" + buffered.keys.join("") : "") +
+                    (buffered.esc ? " bufferedESC" : ""));
                 var extra = 0;
                 var quitBuffered = buffered.esc;
                 for (var bi = 0; bi < buffered.keys.length; bi++) {
@@ -1387,6 +1390,7 @@ interface AppState {
                     if (target >= list.length)
                         return;
                     idx = target < 0 ? 0 : target;
+                    FLPlayer.dbg("advance -> idx=" + idx);
                     continue;
                 }
                 if (outcome === "prev") {
@@ -1394,6 +1398,7 @@ interface AppState {
                         return;
                     var back = idx - 1 + extra;
                     idx = back < 0 ? 0 : (back >= list.length ? list.length - 1 : back);
+                    FLPlayer.dbg("back -> idx=" + idx);
                     continue;
                 }
                 return;
