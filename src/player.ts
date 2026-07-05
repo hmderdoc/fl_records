@@ -234,6 +234,7 @@ namespace FLPlayer {
 
     export class InputPump {
         private buf: string = "";
+        private escAt: number = 0;   // when a lone ESC started waiting
 
         /** Poll for up to maxMs, decoding everything that arrives. */
         pump(maxMs: number): PumpResult {
@@ -263,12 +264,24 @@ namespace FLPlayer {
                 }
                 // ESC ...: need at least ESC [ + final byte to decode a CSI.
                 if (this.buf.length === 1) {
-                    if (idle) {           // nothing followed: it's the Esc key
-                        res.esc = true;
-                        this.buf = "";
+                    // A lone ESC is only the Esc KEY once it has sat
+                    // unextended for a real interval. Resolving it at every
+                    // pump boundary shredded async CSI replies that straddled
+                    // the window: the ESC read as quit, and the tail arrived
+                    // as plain chars — the 'n' of a drain notify became a
+                    // phantom [N]ext (and skipped several tracks).
+                    if (idle) {
+                        if (!this.escAt) {
+                            this.escAt = nowMs();
+                        } else if (nowMs() - this.escAt >= 250) {
+                            res.esc = true;
+                            this.buf = "";
+                            this.escAt = 0;
+                        }
                     }
                     return;
                 }
+                this.escAt = 0;       // ESC got a continuation: a real sequence
                 if (this.buf.charAt(1) !== "[") {
                     res.esc = true;       // ESC + non-CSI: treat as Esc, re-scan rest
                     this.buf = this.buf.substr(1);
@@ -1641,7 +1654,24 @@ namespace FLPlayer {
         if (res.audio[1][0] !== 2 || res.audio[1][1] !== 0) throw new Error("drain notify parse");
         if (res.keys.length !== 1 || res.keys[0] !== "Q") throw new Error("key parse");
         if (res.arrows.length !== 1 || res.arrows[0] !== "right") throw new Error("arrow parse");
-        if (!res.esc) throw new Error("lone ESC parse");
+        if (res.esc) throw new Error("lone ESC resolved too eagerly");
+        (p as any).escAt = nowMs() - 300;   // aged past the patience window
+        (p as any).buf = "\x1b";
+        (p as any).drain(res, true);
+        if (!res.esc) throw new Error("aged lone ESC did not resolve");
+
+        // The killer case: an audio notify split right after its ESC byte
+        // must NOT become Esc + plain chars (the phantom 'N' bug).
+        var pSplit = new InputPump();
+        var rSplit: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [] };
+        (pSplit as any).buf = "\x1b";
+        (pSplit as any).drain(rSplit, true);    // pump boundary hits mid-sequence
+        (pSplit as any).buf += "[=7;2;0n";      // the rest arrives next pump
+        (pSplit as any).drain(rSplit, true);
+        if (rSplit.esc) throw new Error("split notify produced phantom Esc");
+        if (rSplit.keys.length) throw new Error("split notify leaked keys: " + rSplit.keys.join(","));
+        if (rSplit.audio.length !== 1 || rSplit.audio[0][0] !== 2 || rSplit.audio[0][1] !== 0)
+            throw new Error("split notify not reassembled");
         var p3 = new InputPump();
         var r3: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [] };
         (p3 as any).buf = "\x1b[74;162R";
