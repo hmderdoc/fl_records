@@ -157,6 +157,15 @@ declare class JSONChat {
     };
 }
 
+declare class JSONdb {
+    constructor(fileName: string, scope?: string);
+    masterData: { data: { [key: string]: any } };
+    settings: { [k: string]: any };
+    load(): void;
+    save(): void;
+}
+declare function time(): number;
+
 declare function load(...args: any[]): any;
 declare function require(...args: any[]): any;
 declare function log(level: number, message: string): void;

@@ -95,7 +95,12 @@ namespace FLPlayer {
         avatars?: string[];     // raw 10x6 BIN blobs (decoded), up to 2
     }
 
-    export type PlayResult = "quit" | "next" | "prev" | "ended" | "error" | "browse" | "create";
+    export type PlayResult = "quit" | "next" | "prev" | "ended" | "error" | "browse" | "create" | "addplaylist" | "removeplaylist";
+
+    // Track-shuffle toggle (S key). playInTerminal reads this when advancing:
+    // on -> next track is random from the queue, off -> sequential. Shared here
+    // so both the player (toggle/display) and the jukebox loop (advance) see it.
+    export var shuffle = false;
 
     // ---- small helpers --------------------------------------------------
     function shellQuote(s: string): string {
@@ -758,7 +763,7 @@ namespace FLPlayer {
     function drawProgress(l: Layout, playedSec: number, totalSec: number, paused: boolean): void {
         var inner = l.boxWidth - 4;
         var timeTxt = fmtTime(playedSec) + "/" + fmtTime(totalSec);
-        var volTxt = paused ? " PAUSED " : "";
+        var volTxt = paused ? " PAUSED " : (shuffle ? " SHUF " : "");
         var barWidth = inner - timeTxt.length - volTxt.length - 2;
         if (barWidth < 8) {
             volTxt = "";
@@ -777,6 +782,8 @@ namespace FLPlayer {
     var HINTS: { keys: string[]; label: string }[] = [
         { keys: ["Space"], label: "Pause" },
         { keys: ["N", "P"], label: "Track" },
+        { keys: ["S"], label: "huffle" },
+        { keys: ["A"], label: "dd" },
         { keys: ["B"], label: "rowse" },
         { keys: ["C"], label: "reate" },
         { keys: ["Q"], label: "uit" }
@@ -798,7 +805,7 @@ namespace FLPlayer {
         var brt = sgr(tri[2]);
         var out = "";
         var len = 0;
-        var gap = withLabels ? "   " : " ";
+        var gap = withLabels ? "  " : " ";
         for (var i = 0; i < HINTS.length; i++) {
             if (i > 0) { out += gap; len += gap.length; }
             var h = HINTS[i];
@@ -1527,6 +1534,14 @@ namespace FLPlayer {
                 } else if (k === "C") {
                     result = "create";       // jump to the compose-a-song flow
                     quitReq = true;
+                } else if (k === "A") {
+                    result = "addplaylist";  // add the current track to a playlist
+                    quitReq = true;
+                } else if (k === "R") {
+                    result = "removeplaylist"; // remove from the current playlist
+                    quitReq = true;
+                } else if (k === "S") {
+                    shuffle = !shuffle;      // toggle track shuffle (indicator on next tick)
                 }
             }
             for (var a = 0; a < ev.arrows.length; a++) {

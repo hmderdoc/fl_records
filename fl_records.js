@@ -1167,6 +1167,10 @@ var FLPlayer;
     var AVATAR_W = 10; // Synchronet avatar cell dimensions
     var AVATAR_H = 6;
     var detectedSink = null; // per-session cache
+    // Track-shuffle toggle (S key). playInTerminal reads this when advancing:
+    // on -> next track is random from the queue, off -> sequential. Shared here
+    // so both the player (toggle/display) and the jukebox loop (advance) see it.
+    FLPlayer.shuffle = false;
     // ---- small helpers --------------------------------------------------
     function shellQuote(s) {
         return "'" + s.replace(/'/g, "'\\''") + "'";
@@ -1762,7 +1766,7 @@ var FLPlayer;
     function drawProgress(l, playedSec, totalSec, paused) {
         var inner = l.boxWidth - 4;
         var timeTxt = fmtTime(playedSec) + "/" + fmtTime(totalSec);
-        var volTxt = paused ? " PAUSED " : "";
+        var volTxt = paused ? " PAUSED " : (FLPlayer.shuffle ? " SHUF " : "");
         var barWidth = inner - timeTxt.length - volTxt.length - 2;
         if (barWidth < 8) {
             volTxt = "";
@@ -1780,6 +1784,8 @@ var FLPlayer;
     var HINTS = [
         { keys: ["Space"], label: "Pause" },
         { keys: ["N", "P"], label: "Track" },
+        { keys: ["S"], label: "huffle" },
+        { keys: ["A"], label: "dd" },
         { keys: ["B"], label: "rowse" },
         { keys: ["C"], label: "reate" },
         { keys: ["Q"], label: "uit" }
@@ -1800,7 +1806,7 @@ var FLPlayer;
         var brt = sgr(tri[2]);
         var out = "";
         var len = 0;
-        var gap = withLabels ? "   " : " ";
+        var gap = withLabels ? "  " : " ";
         for (var i = 0; i < HINTS.length; i++) {
             if (i > 0) {
                 out += gap;
@@ -2504,6 +2510,17 @@ var FLPlayer;
                     result = "create"; // jump to the compose-a-song flow
                     quitReq = true;
                 }
+                else if (k === "A") {
+                    result = "addplaylist"; // add the current track to a playlist
+                    quitReq = true;
+                }
+                else if (k === "R") {
+                    result = "removeplaylist"; // remove from the current playlist
+                    quitReq = true;
+                }
+                else if (k === "S") {
+                    FLPlayer.shuffle = !FLPlayer.shuffle; // toggle track shuffle (indicator on next tick)
+                }
             }
             for (var a = 0; a < ev.arrows.length; a++) {
                 var dir = ev.arrows[a];
@@ -3116,6 +3133,10 @@ var FLPlayer;
         load("utf8_utf16.js");
     }
     catch (_) { }
+    try {
+        load("json-db.js");
+    }
+    catch (_) { } // per-user playlist storage
     function createDefaultFilters() {
         return {
             search: "",
@@ -4352,7 +4373,7 @@ var FLPlayer;
         }
         return out;
     }
-    function playInTerminal(track, list, index) {
+    function playInTerminal(track, list, index, playlistName) {
         withConsoleScreen(function () {
             console.clear();
             printConsoleHeader("Play In Terminal");
@@ -4371,6 +4392,7 @@ var FLPlayer;
             console.writeln("Audio sink: " + (sink === "syncterm" ? "SyncTERM (libsndfile)" : "APC bridge"));
             var curList = (list && list.length) ? list : [track];
             var idx = typeof index === "number" ? Math.max(0, Math.min(index, curList.length - 1)) : 0;
+            var currentPlaylist = playlistName || ""; // set when the queue is a playlist (enables [R]emove)
             while (bbs.online && !js.terminated) {
                 var cur = curList[idx];
                 // Immediate feedback for the inter-track gap (tag parse +
@@ -4435,11 +4457,38 @@ var FLPlayer;
                     return;
                 if (outcome === "browse") {
                     // Typeahead browser: picking sets a new play queue (the
-                    // filtered results); cancelling replays the current track.
+                    // filtered results, or a whole playlist via the Manager);
+                    // cancelling replays the current track.
                     var pick = browseSongs(activeApp);
                     if (pick && pick.list.length) {
                         curList = pick.list;
                         idx = Math.max(0, Math.min(pick.index, curList.length - 1));
+                        currentPlaylist = pick.playlist || "";
+                        if (pick.playlist)
+                            FLPlayer.shuffle = false; // play a playlist in its arranged order
+                    }
+                    console.clear();
+                    continue;
+                }
+                if (outcome === "addplaylist") {
+                    addToPlaylistFlow(curList[idx].name, displayTrackTitle(curList[idx]));
+                    console.clear();
+                    continue;
+                }
+                if (outcome === "removeplaylist") {
+                    if (currentPlaylist && curList.length) {
+                        plRemoveTrack(currentPlaylist, curList[idx].name);
+                        curList.splice(idx, 1); // drop from the live queue too
+                        if (!curList.length)
+                            return; // playlist emptied -> leave
+                        if (idx >= curList.length)
+                            idx = 0;
+                    }
+                    else {
+                        console.clear();
+                        console.writeln("");
+                        console.writeln("  Not playing from a playlist -- nothing to remove.");
+                        mswait(1200);
                     }
                     console.clear();
                     continue;
@@ -4462,10 +4511,20 @@ var FLPlayer;
                 }
                 // Radio flow: songs advance continuously and WRAP so the station
                 // never stops; N/P (and Left/Right) move manually; Q/Esc exits.
+                // With shuffle on, a natural advance picks a random other track;
+                // an explicit N/P (extra != 0) still steps sequentially.
                 if (outcome === "next" || outcome === "ended") {
-                    var target = idx + 1 + extra;
-                    idx = target >= curList.length ? 0 : (target < 0 ? 0 : target);
-                    FLPlayer.dbg("advance -> idx=" + idx);
+                    if (FLPlayer.shuffle && extra === 0 && curList.length > 1) {
+                        var ni = idx;
+                        while (ni === idx)
+                            ni = Math.floor(Math.random() * curList.length);
+                        idx = ni;
+                    }
+                    else {
+                        var target = idx + 1 + extra;
+                        idx = target >= curList.length ? 0 : (target < 0 ? 0 : target);
+                    }
+                    FLPlayer.dbg("advance -> idx=" + idx + (FLPlayer.shuffle ? " (shuffle)" : ""));
                     continue;
                 }
                 if (outcome === "prev") {
@@ -4525,6 +4584,166 @@ var FLPlayer;
             }
         });
     }
+    // --- playlist storage (per-user, JSONdb) -------------------------------
+    // Playlists live BBS-side (this box is authoritative; the web can consume
+    // data/playlists.json later). Per-user map: { [userKey]: { [name]:
+    // {name, tracks:[filename], created} } }. Follows future_shell's shell_prefs
+    // JSONdb pattern (new JSONdb -> load() -> masterData.data[key] -> save()).
+    var PLAYLIST_SCOPE = "FLRECORDS_PLAYLISTS";
+    function playlistDbPath() {
+        return pathJoin(dataDirPath(), "playlists.json");
+    }
+    function playlistUserKey() {
+        var raw = safeString(user && user.alias ? user.alias : ("user" + (user ? user.number : 0)));
+        var k = raw.replace(/[^A-Za-z0-9_\-\.]/g, "_");
+        return k.length ? k : "default";
+    }
+    function openPlaylistDb() {
+        if (typeof JSONdb !== "function")
+            return null;
+        ensureDataDir();
+        var db;
+        try {
+            db = new JSONdb(playlistDbPath(), PLAYLIST_SCOPE);
+        }
+        catch (_) {
+            return null;
+        }
+        if (db && db.settings)
+            db.settings.KEEP_READABLE = true;
+        try {
+            db.load();
+        }
+        catch (_e) { }
+        if (!db.masterData || typeof db.masterData !== "object")
+            db.masterData = { data: {} };
+        if (!db.masterData.data || typeof db.masterData.data !== "object")
+            db.masterData.data = {};
+        return db;
+    }
+    // Read the current user's playlists (fresh from disk), sorted by name.
+    function loadPlaylists() {
+        var db = openPlaylistDb();
+        if (!db)
+            return [];
+        var raw = db.masterData.data[playlistUserKey()];
+        var out = [];
+        if (raw && typeof raw === "object") {
+            for (var name in raw) {
+                if (!raw.hasOwnProperty(name))
+                    continue;
+                var p = raw[name];
+                if (p && p.tracks && typeof p.tracks.length === "number")
+                    out.push({ name: safeString(p.name || name), tracks: p.tracks.slice(), created: p.created || 0 });
+            }
+        }
+        out.sort(function (a, b) {
+            return lower(a.name) < lower(b.name) ? -1 : (lower(a.name) > lower(b.name) ? 1 : 0);
+        });
+        return out;
+    }
+    // Load -> mutate -> save the user's playlists atomically on one db handle.
+    function mutatePlaylists(fn) {
+        var db = openPlaylistDb();
+        if (!db)
+            return false;
+        var key = playlistUserKey();
+        var raw = db.masterData.data[key];
+        var list = [];
+        if (raw && typeof raw === "object") {
+            for (var name in raw) {
+                if (!raw.hasOwnProperty(name))
+                    continue;
+                var p = raw[name];
+                if (p)
+                    list.push({ name: safeString(p.name || name), tracks: (p.tracks || []).slice(), created: p.created || 0 });
+            }
+        }
+        fn(list);
+        var map = {};
+        for (var i = 0; i < list.length; i += 1)
+            map[list[i].name] = { name: list[i].name, tracks: list[i].tracks, created: list[i].created };
+        db.masterData.data[key] = map;
+        try {
+            db.save();
+            return true;
+        }
+        catch (_) {
+            return false;
+        }
+    }
+    function findPlaylist(list, name) {
+        for (var i = 0; i < list.length; i += 1)
+            if (lower(list[i].name) === lower(name))
+                return list[i];
+        return null;
+    }
+    function plNow() {
+        return typeof time === "function" ? time() : 0;
+    }
+    // Create a playlist (optionally seeded with a track). Returns false if the
+    // name is taken or blank.
+    function plCreate(name, seedTrack) {
+        var clean = trimValue(name);
+        if (!clean.length)
+            return false;
+        return mutatePlaylists(function (list) {
+            if (findPlaylist(list, clean))
+                return;
+            list.push({ name: clean, tracks: seedTrack ? [seedTrack] : [], created: plNow() });
+        });
+    }
+    function plAddTrack(name, trackName) {
+        return mutatePlaylists(function (list) {
+            var pl = findPlaylist(list, name);
+            if (!pl) {
+                pl = { name: trimValue(name), tracks: [], created: plNow() };
+                list.push(pl);
+            }
+            for (var i = 0; i < pl.tracks.length; i += 1)
+                if (pl.tracks[i] === trackName)
+                    return; // dedupe
+            pl.tracks.push(trackName);
+        });
+    }
+    function plRemoveTrack(name, trackName) {
+        return mutatePlaylists(function (list) {
+            var pl = findPlaylist(list, name);
+            if (!pl)
+                return;
+            var kept = [];
+            for (var i = 0; i < pl.tracks.length; i += 1)
+                if (pl.tracks[i] !== trackName)
+                    kept.push(pl.tracks[i]);
+            pl.tracks = kept;
+        });
+    }
+    function plDelete(name) {
+        return mutatePlaylists(function (list) {
+            for (var i = list.length - 1; i >= 0; i -= 1)
+                if (lower(list[i].name) === lower(name))
+                    list.splice(i, 1);
+        });
+    }
+    function plRename(oldName, newName) {
+        var clean = trimValue(newName);
+        if (!clean.length)
+            return false;
+        return mutatePlaylists(function (list) {
+            if (findPlaylist(list, clean) && lower(clean) !== lower(oldName))
+                return; // name taken
+            var pl = findPlaylist(list, oldName);
+            if (pl)
+                pl.name = clean;
+        });
+    }
+    function plSetOrder(name, tracks) {
+        return mutatePlaylists(function (list) {
+            var pl = findPlaylist(list, name);
+            if (pl)
+                pl.tracks = tracks.slice();
+        });
+    }
     // --- console drawing helpers for the typeahead browser -----------------
     function csiAt(y, x) { return "\x1b[" + y + ";" + x + "H"; }
     function csiSgr(codes) { return "\x1b[" + codes + "m"; }
@@ -4535,6 +4754,197 @@ var FLPlayer;
         if (text.length >= width)
             return text.substring(0, width);
         return padRight(text, width);
+    }
+    // --- playlist UI flows -------------------------------------------------
+    // Bring uifc up for a menu flow from a console-mode context (browse/player),
+    // draining any APC reply tail first (the shim's getkey doesn't swallow it,
+    // so a stray drain-notify would dismiss the menu). Restores prior UI state.
+    function runUifcFlow(fn) {
+        // 450ms: enough to swallow the player's exit-flush fade (O=250) + its
+        // drain notify, whose ESC would otherwise dismiss the shim menu (the
+        // uifc shim's getkey, unlike the pump, doesn't filter APC replies).
+        FLPlayer.pumpShared(450);
+        var hadUi = uiReady;
+        if (!hadUi)
+            initUi();
+        try {
+            fn();
+        }
+        finally {
+            if (!hadUi)
+                safeBailUi();
+        }
+    }
+    function trackTitleForName(fname) {
+        var cat = activeApp ? activeApp.catalog : [];
+        for (var i = 0; i < cat.length; i += 1)
+            if (cat[i].name === fname)
+                return toScreenText(displayTrackTitle(cat[i]));
+        return fname;
+    }
+    // Resolve a playlist's filenames to catalog tracks (skipping any missing).
+    function playlistToTracks(pl) {
+        var out = [];
+        var cat = activeApp ? activeApp.catalog : [];
+        for (var i = 0; i < pl.tracks.length; i += 1) {
+            for (var j = 0; j < cat.length; j += 1) {
+                if (cat[j].name === pl.tracks[i]) {
+                    out.push(cat[j]);
+                    break;
+                }
+            }
+        }
+        return out;
+    }
+    // Add one track to a playlist: pick an existing one or create a new one.
+    function addToPlaylistFlow(trackName, trackTitle) {
+        runUifcFlow(function () {
+            var pls = loadPlaylists();
+            var options = ["[+ Create New Playlist]"];
+            for (var i = 0; i < pls.length; i += 1)
+                options.push(pls[i].name + "   (" + pls[i].tracks.length + ")");
+            uifc.help_text = "Add \"" + toScreenText(trackTitle) + "\" to a playlist. Choose one, or create a new playlist named for this song.";
+            var choice = uifc.list(WIN_ESC | WIN_SAV | WIN_ACT, "Add to Playlist", options, new uifc.list.CTX());
+            if (choice < 0)
+                return;
+            if (choice === 0) {
+                var name = promptInput("New playlist name", "", 60, K_EDIT);
+                if (name === null || !trimValue(name).length)
+                    return;
+                plAddTrack(trimValue(name), trackName); // creates if new, dedupes
+                uifc.msg("Added to \"" + trimValue(name) + "\".");
+                return;
+            }
+            plAddTrack(pls[choice - 1].name, trackName);
+            uifc.msg("Added to \"" + pls[choice - 1].name + "\".");
+        });
+    }
+    // Drag-to-reorder a playlist's songs (console-drawn). Enter grabs the
+    // highlighted song, Up/Down move it, Enter drops; Esc saves and exits.
+    function reorderPlaylistUi(name) {
+        var hadUi = uiReady;
+        if (hadUi)
+            safeBailUi();
+        try {
+            var pl = findPlaylist(loadPlaylists(), name);
+            if (!pl)
+                return;
+            var tracks = pl.tracks.slice();
+            var sel = 0, grabbed = -1, top = 0;
+            var full = true, dirty = true;
+            while (bbs.online && !js.terminated) {
+                var cols = Math.max(40, console.screen_columns || 80);
+                var rows = Math.max(10, console.screen_rows || 24);
+                var listTop = 4;
+                var listH = Math.max(1, rows - listTop - 1);
+                if (sel < top)
+                    top = sel;
+                if (sel >= top + listH)
+                    top = sel - listH + 1;
+                if (top < 0)
+                    top = 0;
+                if (full) {
+                    console.write("\x1b[?25l\x1b[2J");
+                    full = false;
+                    dirty = true;
+                }
+                if (dirty) {
+                    console.write(csiAt(1, 1) + csiSgr("0;1;36") + padClip(" REORDER: " + name, cols) + CSI_RESET);
+                    console.write(csiAt(2, 1) + csiSgr("0;30;46") +
+                        padClip("  ENTER grab/drop    UP/DN move    ESC save & back  ", cols) + CSI_RESET);
+                    for (var r = 0; r < listH; r += 1) {
+                        var idx = top + r, y = listTop + r;
+                        var w = (y >= rows) ? cols - 1 : cols;
+                        var txt = idx < tracks.length ? (idx === grabbed ? " <> " : "    ") +
+                            trackTitleForName(tracks[idx]) : "";
+                        var on = idx === sel;
+                        var sgrc = idx === grabbed ? "0;1;33;44" : (on ? "0;37;44" : "0;37");
+                        console.write(csiAt(y, 1) + csiSgr(sgrc) + padClip(txt, w) + CSI_RESET);
+                    }
+                    dirty = false;
+                }
+                var ev = FLPlayer.pumpShared(120);
+                if (ev.esc || ev.keys.length || ev.arrows.length)
+                    dirty = true;
+                for (var ki = 0; ki < ev.keys.length; ki += 1) {
+                    if (ev.keys[ki] === "\r")
+                        grabbed = (grabbed === sel) ? -1 : sel;
+                }
+                for (var ai = 0; ai < ev.arrows.length; ai += 1) {
+                    var d = ev.arrows[ai];
+                    var dir = (d === "up") ? -1 : (d === "down") ? 1 : 0;
+                    if (!dir)
+                        continue;
+                    if (grabbed >= 0) {
+                        var ni = grabbed + dir;
+                        if (ni >= 0 && ni < tracks.length) {
+                            var tmp = tracks[grabbed];
+                            tracks[grabbed] = tracks[ni];
+                            tracks[ni] = tmp;
+                            grabbed = ni;
+                            sel = ni;
+                        }
+                    }
+                    else {
+                        sel = Math.max(0, Math.min(tracks.length - 1, sel + dir));
+                    }
+                }
+                if (ev.esc)
+                    break;
+            }
+            console.write("\x1b[?25h" + CSI_RESET);
+            plSetOrder(name, tracks);
+        }
+        finally {
+            if (hadUi)
+                initUi();
+        }
+    }
+    // Playlist Manager: list playlists, then Play / Rename / Reorder / Delete.
+    // Returns a queue to play (from "Play"), or null.
+    function playlistManager() {
+        var toPlay = null;
+        runUifcFlow(function () {
+            var mgrCtx = new uifc.list.CTX();
+            while (bbs.online && !js.terminated) {
+                var pls = loadPlaylists();
+                var options = [];
+                for (var i = 0; i < pls.length; i += 1)
+                    options.push(pls[i].name + "   (" + pls[i].tracks.length + " tracks)");
+                if (!pls.length)
+                    options.push("(no playlists yet - add songs from Browse or the player)");
+                uifc.help_text = "Your playlists. Select one to Play / Rename / Reorder / Delete. Add songs with ENTER in Browse or [A] in the player.";
+                var choice = uifc.list(WIN_ESC | WIN_SAV | WIN_ACT, "Playlist Manager", options, mgrCtx);
+                if (choice < 0)
+                    return;
+                if (!pls.length)
+                    continue;
+                var pl = pls[choice];
+                var action = uifc.list(WIN_ESC | WIN_SAV | WIN_ACT, pl.name + " (" + pl.tracks.length + ")", ["Play", "Rename", "Reorder songs", "Delete", "Back"], new uifc.list.CTX());
+                if (action === 0) {
+                    var built = playlistToTracks(pl);
+                    if (!built.length) {
+                        uifc.msg("That playlist has no playable songs.");
+                        continue;
+                    }
+                    toPlay = { list: built, index: 0, playlist: pl.name };
+                    return;
+                }
+                else if (action === 1) {
+                    var nn = promptInput("Rename playlist", pl.name, 60, K_EDIT);
+                    if (nn !== null && trimValue(nn).length)
+                        plRename(pl.name, trimValue(nn));
+                }
+                else if (action === 2) {
+                    reorderPlaylistUi(pl.name);
+                }
+                else if (action === 3) {
+                    if (uifc.list(WIN_MID | WIN_SAV, "Delete \"" + pl.name + "\"?", ["No", "Yes"]) === 1)
+                        plDelete(pl.name);
+                }
+            }
+        });
+        return toPlay;
     }
     // Typeahead song browser. Live-filters the catalog as you type; ALL printable
     // keys feed the search (so commands must be non-letters: Enter plays, Tab
@@ -4596,7 +5006,7 @@ var FLPlayer;
                         padClip(" Search: " + search + "_", Math.max(0, cols - count.length)) +
                         csiSgr("0;1;36") + count + CSI_RESET);
                     console.write(csiAt(3, 1) + csiSgr("0;30;46") +
-                        padClip("  ENTER play    TAB details    BKSP clear    ESC back  ", cols) + CSI_RESET);
+                        padClip("  SPACE play   ENTER +playlist   TAB manager   BKSP clear   ESC back  ", cols) + CSI_RESET);
                     for (var r = 0; r < listH; r += 1) {
                         var idx = top + r;
                         var y = listTop + r;
@@ -4622,11 +5032,26 @@ var FLPlayer;
                 }
                 for (var ki = 0; ki < ev.keys.length && !done; ki += 1) {
                     var k = ev.keys[ki];
-                    if (k === "\r") { // Enter only; \n (0x0a) is KEY_DOWN, handled as an arrow
+                    if (k === " ") { // SPACE plays the highlighted song
                         if (filtered.length) {
                             result = { list: filtered, index: sel };
                             done = true;
                         }
+                    }
+                    else if (k === "\r") { // ENTER adds it to a playlist
+                        if (filtered.length) {
+                            addToPlaylistFlow(filtered[sel].name, displayTrackTitle(filtered[sel]));
+                            full = true;
+                        }
+                    }
+                    else if (k === "\t") { // TAB opens the Playlist Manager
+                        var pm = playlistManager();
+                        if (pm) {
+                            result = { list: pm.list, index: pm.index, playlist: pm.playlist };
+                            done = true;
+                        }
+                        else
+                            full = true;
                     }
                     else if (k === "\x08" || k === "\x7f") {
                         if (search.length) {
@@ -4635,13 +5060,7 @@ var FLPlayer;
                             recompute();
                         }
                     }
-                    else if (k === "\t") {
-                        if (filtered.length) {
-                            showTrackDetail(filtered[sel], filtered, sel);
-                            full = true;
-                        }
-                    }
-                    else if (k.length === 1 && k >= " " && k <= "~") {
+                    else if (k.length === 1 && k > " " && k <= "~") { // letters filter (space is play)
                         search += k.toLowerCase();
                         sel = 0;
                         recompute();
@@ -5404,6 +5823,8 @@ var FLPlayer;
             noAudioFallback(app);
             return;
         }
+        // The all-songs radio shuffles by default; S toggles to sequential.
+        FLPlayer.shuffle = true;
         var list = shuffledCatalog(app);
         playInTerminal(list[0], list, 0);
     }
@@ -5434,9 +5855,43 @@ var FLPlayer;
         must(screenSafe(String.fromCharCode(0x201C) + "hi" + String.fromCharCode(0x201D)), "\"hi\"", "smart-quotes");
         writeln("sanitizer self-test: OK");
     }
+    function playlistSelfTest() {
+        if (typeof JSONdb !== "function") {
+            writeln("playlist self-test: SKIP (no JSONdb)");
+            return;
+        }
+        var TP = "__fltest__";
+        plDelete(TP);
+        plDelete(TP + "2");
+        if (!plCreate(TP, "a.mp3"))
+            throw new Error("plCreate failed");
+        plAddTrack(TP, "b.mp3");
+        plAddTrack(TP, "b.mp3"); // dedupe
+        var pl = findPlaylist(loadPlaylists(), TP);
+        if (!pl)
+            throw new Error("playlist not persisted");
+        if (pl.tracks.join(",") !== "a.mp3,b.mp3")
+            throw new Error("tracks: " + pl.tracks.join(","));
+        plSetOrder(TP, ["b.mp3", "a.mp3"]);
+        if (findPlaylist(loadPlaylists(), TP).tracks.join(",") !== "b.mp3,a.mp3")
+            throw new Error("reorder");
+        plRemoveTrack(TP, "b.mp3");
+        if (findPlaylist(loadPlaylists(), TP).tracks.join(",") !== "a.mp3")
+            throw new Error("remove");
+        plRename(TP, TP + "2");
+        if (findPlaylist(loadPlaylists(), TP))
+            throw new Error("rename left old");
+        if (!findPlaylist(loadPlaylists(), TP + "2"))
+            throw new Error("rename lost new");
+        plDelete(TP + "2");
+        if (findPlaylist(loadPlaylists(), TP + "2"))
+            throw new Error("delete failed");
+        writeln("playlist self-test: OK");
+    }
     function main() {
         if (typeof argv !== "undefined" && argv && argv.indexOf("--selftest") >= 0) {
             sanitizerSelfTest();
+            playlistSelfTest();
             FLPlayer.selfTest();
             return;
         }
