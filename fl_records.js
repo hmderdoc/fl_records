@@ -1979,6 +1979,8 @@ var FLPlayer;
         var rings = [];
         var fieldTick = 0; // field effects repaint on alternate ticks
         var lastProbeAt = 0;
+        var lastConsoleCols = console.screen_columns || 0;
+        var lastConsoleRows = console.screen_rows || 0;
         // Onset + energy tracking (all on RAW rms, updated once per chunk):
         // emaFast (~1s) is the local level — a chunk jumping clearly above it
         // is a beat/accent, even mid-plateau. emaSlow (~6s) is the passage
@@ -2201,18 +2203,26 @@ var FLPlayer;
             }
             if (quitReq)
                 break;
-            // Responsive layout: a parked-cursor CPR probe every 2s catches
-            // client-side resizes (SyncTERM answers 6n; so does iTerm2); a
-            // NAWS-updated console.screen_* is folded in on the same path.
+            // Responsive layout, two channels, both always live:
+            //  - console.screen_* is watched EVERY iteration — for an
+            //    in-process door this updates on NAWS / SSH window-change
+            //    (and when the BBS consumes a CPR itself), so it works even
+            //    if our own probe replies never reach inkey.
+            //  - a parked-cursor CPR probe every 2s measures the REAL
+            //    terminal through any proxy; its reply, when it arrives,
+            //    overrides. relayout() dedupes, so agreement costs nothing.
+            var conC = console.screen_columns || 0;
+            var conR = console.screen_rows || 0;
+            if (conC && conR && (conC !== lastConsoleCols || conR !== lastConsoleRows)) {
+                lastConsoleCols = conC;
+                lastConsoleRows = conR;
+                relayout(conC, conR);
+            }
             for (var cp = 0; cp < ev.cpr.length; cp++)
                 relayout(ev.cpr[cp][1], ev.cpr[cp][0]);
             if (now - lastProbeAt >= 2000) {
                 lastProbeAt = now;
                 console.write("\x1b7\x1b[999;999H\x1b[6n\x1b8");
-                var nawsC = console.screen_columns || 0;
-                var nawsR = console.screen_rows || 0;
-                if (!termCols && nawsC && nawsR && (nawsC !== l.cols || nawsR !== l.rows))
-                    relayout(nawsC, nawsR);
             }
             // Natural end fallback (in case the drain notify was lost).
             if (!paused && chunk >= totalChunks && playMs > totalSec * 1000 + 1500) {
