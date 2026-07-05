@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES5",
+    "module": "none",
+    "outFile": "./fl_records.js",
+    "rootDir": "./src",
+    "lib": [
+      "es5"
+    ],
+    "strict": false,
+    "skipLibCheck": true,
+    "noEmitOnError": true,
+    "removeComments": false
+  },
+  "files": [
+    "./src/globals.d.ts",
+    "./src/uifc_shim.ts",
+    "./src/options.ts",
+    "./src/player.ts",
+    "./src/fl_records.ts"
+  ]
+}
