@@ -1273,7 +1273,7 @@ interface AppState {
         var seen: { [k: string]: boolean } = {};
         var aiMap = cowriterAvatars();
         var avatarLib: any = null;
-        for (var j = 0; j < names.length && out.length < 2; j++) {
+        for (var j = 0; j < names.length && out.length < 4; j++) {
             var keyName = lower(names[j]);
             if (seen[keyName]) continue;
             seen[keyName] = true;

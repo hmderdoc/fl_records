@@ -924,16 +924,21 @@ namespace FLPlayer {
         var zoneH = l.artBottom - l.artTop + 1;
         if (zoneW < AVATAR_W + 4 || zoneH < AVATAR_H + 2)
             return sprites;
-        for (var i = 0; i < blobs.length && i < 2; i++) {
+        var count = Math.min(blobs.length, 4);
+        for (var i = 0; i < count; i++) {
             var grid = FLAnsiGrid.renderBin(blobs[i], AVATAR_W, AVATAR_H);
             if (!grid)
                 continue;
+            // Spread starting positions across the zone so a full crew
+            // doesn't spawn stacked.
+            var span = Math.max(1, zoneW - AVATAR_W - 4);
+            var sx = 3 + (count > 1 ? Math.floor(span * i / (count - 1)) : Math.floor(span / 2));
             sprites.push({
                 grid: grid,
                 flipped: FLAnsiGrid.mirror(grid),
                 facing: (i % 2 === 0) ? 1 : -1,
-                x: i === 0 ? 3 : Math.max(3, zoneW - AVATAR_W - 2),
-                y: l.artTop + 1 + i * 2,
+                x: sx,
+                y: l.artTop + 1 + (i * 3) % Math.max(1, zoneH - AVATAR_H),
                 vx: (i % 2 === 0 ? 1 : -1) * 0.9,
                 vy: 0.35 * (i % 2 === 0 ? 1 : -1),
                 drawnX: -1,
@@ -993,10 +998,11 @@ namespace FLPlayer {
                 s.trail = (s.trail + 1 + Math.floor(Math.random() * 2)) % TRAIL_COLORS.length;
         }
 
-        // Pairwise collision: overlap -> swap velocities and separate.
-        for (i = 0; i + 1 < sprites.length; i++) {
+        // Pairwise collision (all pairs): overlap -> swap velocities and separate.
+        for (i = 0; i < sprites.length; i++)
+        for (var j = i + 1; j < sprites.length; j++) {
             var a = sprites[i];
-            var b = sprites[i + 1];
+            var b = sprites[j];
             if (Math.abs(a.x - b.x) < AVATAR_W && Math.abs(a.y - b.y) < AVATAR_H) {
                 var tvx = a.vx; a.vx = b.vx; b.vx = tvx;
                 var tvy = a.vy; a.vy = b.vy; b.vy = tvy;
