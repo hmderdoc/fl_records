@@ -16,6 +16,7 @@
     "./src/globals.d.ts",
     "./src/uifc_shim.ts",
     "./src/options.ts",
+    "./src/ansigrid.ts",
     "./src/player.ts",
     "./src/fl_records.ts"
   ]

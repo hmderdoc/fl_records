@@ -1132,6 +1132,130 @@ interface AppState {
         return "Browser bridge unavailable.\n\nOpen this URL in the browser:\n" + relativeUrl;
     }
 
+    function loadSidecarSyncedLyrics(track: TrackSummary): FLPlayer.LyricLine[] {
+        var out: FLPlayer.LyricLine[] = [];
+        var lrcPath = track.path.replace(/\.mp3$/i, ".lrc");
+        if (!file_exists(lrcPath)) return out;
+        var file = new File(lrcPath);
+        if (!file.open("r")) return out;
+        var raw: string;
+        try {
+            raw = file.read();
+        } finally {
+            file.close();
+        }
+        raw = raw.replace(/\r/g, "");
+        var parts = raw.split("\n");
+        for (var i = 0; i < parts.length; i += 1) {
+            // A line may carry several [mm:ss.xx] tags (repeated chorus).
+            var text = trimValue(parts[i].replace(/\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]/g, ""));
+            if (!text.length) continue;
+            var rx = /\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]/g;
+            var m: RegExpExecArray | null;
+            while ((m = rx.exec(parts[i])) !== null) {
+                var frac = m[3] ? parseInt(m[3], 10) / Math.pow(10, m[3].length) : 0;
+                out.push({ time: parseInt(m[1], 10) * 60 + parseInt(m[2], 10) + frac, text: text });
+            }
+        }
+        out.sort(function (a: FLPlayer.LyricLine, b: FLPlayer.LyricLine): number {
+            return a.time - b.time;
+        });
+        return out;
+    }
+
+    // AI co-writer avatars from the local-aidefinitions sub (same source the
+    // web records page uses): base64 10x6 BIN between avatar_data markers in
+    // each persona's thread-origin message body. Cached per session.
+    var cowriterAvatarCache: { [name: string]: string } | null = null;
+
+    function cowriterAvatars(): { [name: string]: string } {
+        if (cowriterAvatarCache !== null) return cowriterAvatarCache;
+        var map: { [name: string]: string } = {};
+        var subCode = "local-aidefinitions";
+        if (!msg_area.sub[subCode]) {
+            cowriterAvatarCache = map;
+            return map;
+        }
+        try {
+            var msgBase = new MsgBase(subCode);
+            if (msgBase.open()) {
+                var headers: any = msgBase.get_all_msg_headers(true);
+                var origins: { [threadId: string]: any } = {};
+                for (var key in headers) {
+                    if (!headers.hasOwnProperty(key)) continue;
+                    var header = headers[key];
+                    if (!header || (header.attr & MSG_DELETE)) continue;
+                    if (!origins[safeString(header.thread_id)])
+                        origins[safeString(header.thread_id)] = header;
+                }
+                for (var tid in origins) {
+                    if (!origins.hasOwnProperty(tid)) continue;
+                    var hdr = origins[tid];
+                    var name = trimValue(safeString(hdr.subject).replace(/^re:\s*/i, ""));
+                    if (!name.length) continue;
+                    try {
+                        var body = safeString(msgBase.get_msg_body(hdr.number));
+                        var m1 = body.indexOf("avatar_data_begin");
+                        var m2 = body.indexOf("avatar_data_end");
+                        if (m1 >= 0 && m2 > m1) {
+                            var b64 = body.substring(m1 + 17, m2).replace(/[\r\n\s]/g, "");
+                            if (b64.length) map[lower(name)] = b64;
+                        }
+                    } catch (ignored) { }
+                }
+                msgBase.close();
+            }
+        } catch (err) {
+            log(LOG_WARNING, "fl_records cowriter avatar load failed: " + safeString(err));
+        }
+        cowriterAvatarCache = map;
+        return map;
+    }
+
+    // Resolve up to two 10x6 avatar BIN blobs for a track: split the artist
+    // on feat./separators, then try AI co-writers, then local BBS users.
+    function trackAvatars(track: TrackSummary): string[] {
+        var out: string[] = [];
+        var names: string[] = [];
+        var raw = trimValue(displayTrackArtist(track));
+        var parts = raw.split(/\s+feat\.?\s+|\s+featuring\s+|\s*[,&+]\s*|\s+x\s+/i);
+        for (var i = 0; i < parts.length; i++) {
+            var n = trimValue(parts[i]);
+            if (n.length) names.push(n);
+        }
+        var comp = trimValue(track.composer);
+        if (comp.length) names.push(comp);
+        var seen: { [k: string]: boolean } = {};
+        var aiMap = cowriterAvatars();
+        var avatarLib: any = null;
+        for (var j = 0; j < names.length && out.length < 2; j++) {
+            var keyName = lower(names[j]);
+            if (seen[keyName]) continue;
+            seen[keyName] = true;
+            var data = "";
+            if (aiMap[keyName]) {
+                data = aiMap[keyName];
+            } else {
+                try {
+                    var un = system.matchuser(names[j]);
+                    if (un > 0) {
+                        if (avatarLib === null)
+                            avatarLib = load({}, "avatar_lib.js");
+                        var obj = avatarLib.read_localuser(un);
+                        if (obj && obj.data && !obj.disabled)
+                            data = safeString(obj.data);
+                    }
+                } catch (ignored2) { }
+            }
+            if (data.length) {
+                var bin = base64_decode(data.replace(/[\r\n\s]/g, ""));
+                if (bin.length >= 120)
+                    out.push(bin);
+            }
+        }
+        return out;
+    }
+
     function playInTerminal(track: TrackSummary, list?: TrackSummary[], index?: number): void {
         withConsoleScreen(function (): void {
             console.clear();
@@ -1154,9 +1278,24 @@ interface AppState {
             while (bbs.online && !js.terminated) {
                 var cur = (list && list.length) ? list[idx] : track;
                 var parsed = parseTrackTags(cur.path, {
-                    includeLyrics: false,
+                    includeLyrics: true,
                     includeAnsiArt: true
                 });
+                // Timed lyrics: embedded SYLT first, then a timestamped .lrc
+                // sidecar; untimed text distributes evenly over the duration.
+                var timed: FLPlayer.LyricLine[] = [];
+                if (parsed.syncedLyrics && parsed.syncedLyrics.length) {
+                    for (var si = 0; si < parsed.syncedLyrics.length; si++) {
+                        timed.push({
+                            time: parsed.syncedLyrics[si].time,
+                            text: toScreenText(parsed.syncedLyrics[si].text)
+                        });
+                    }
+                } else {
+                    timed = loadSidecarSyncedLyrics(cur);
+                }
+                var flat = timed.length ? "" :
+                    toScreenText(trimValue(parsed.lyricsText || loadSidecarLyrics(cur)));
                 var playable: FLPlayer.PlayableTrack = {
                     path: cur.path,
                     name: cur.name,
@@ -1164,7 +1303,10 @@ interface AppState {
                     mtime: cur.mtime,
                     title: toScreenText(displayTrackTitle(cur)),
                     artist: toScreenText(displayTrackArtist(cur)),
-                    ansiArt: parsed.ansiArtBase64.length ? base64_decode(parsed.ansiArtBase64) : ""
+                    ansiArt: parsed.ansiArtBase64.length ? base64_decode(parsed.ansiArtBase64) : "",
+                    lyrics: timed,
+                    flatLyrics: flat,
+                    avatars: trackAvatars(cur)
                 };
                 var outcome = FLPlayer.playTrack(playable);
                 // Jukebox flow: a song ending naturally advances to the next

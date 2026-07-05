@@ -18,6 +18,7 @@ declare var system: {
     inet_addr: string;
     datestr(value: number): string;
     username(userNumber: number): string;
+    matchuser(alias: string, sysopOk?: boolean): number;
     exec(commandLine: string): number;
     popen(commandLine: string): string[] | null;
 };

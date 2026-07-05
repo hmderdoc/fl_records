@@ -741,9 +741,259 @@ var FLRecordsData;
     };
 })(FLRecordsData || (FLRecordsData = {}));
 /*
+ * FLAnsiGrid — interpret CP437 ANSI art into a cell grid, then blit
+ * arbitrary windows of it anywhere on screen.
+ *
+ * Classic .ans art has no newlines: it relies on the terminal wrapping at
+ * column 80. Dumping it raw onto a wider terminal skews every row (and a
+ * trailing SAUCE metadata record prints as garbage). Interpreting into a
+ * grid fixes both, and gives us free extras: center/trim to any terminal
+ * size, palette rotation for the beat visualizer without re-parsing, and
+ * the same cell/attr model for 10x6 BIN avatars.
+ *
+ * Cell attr byte = CGA convention: fg 0-7 | bright 0x08 | bg<<4 | blink 0x80.
+ */
+var FLAnsiGrid;
+(function (FLAnsiGrid) {
+    var DEFAULT_ATTR = 0x07;
+    var MAX_ROWS = 200;
+    // CGA color index -> ANSI SGR foreground code (bg = +10).
+    var CGA_TO_SGR = [30, 34, 32, 36, 31, 35, 33, 37];
+    // SGR 30-37 parameter -> CGA index.
+    var SGR_TO_CGA = [0, 4, 2, 6, 1, 5, 3, 7];
+    // One step of chromatic hue rotation over CGA indexes 1..6 (0/7 stay).
+    var HUE_NEXT = [0, 5, 3, 1, 6, 4, 2, 7];
+    /** Remove a trailing SAUCE record (and the EOF marker it follows). */
+    function stripSauce(art) {
+        if (art.length >= 128 && art.substr(art.length - 128, 7) === "SAUCE00") {
+            var eof = art.lastIndexOf("\x1a");
+            return eof >= 0 ? art.substr(0, eof) : art.substr(0, art.length - 128);
+        }
+        var bare = art.indexOf("\x1a");
+        return bare >= 0 ? art.substr(0, bare) : art;
+    }
+    FLAnsiGrid.stripSauce = stripSauce;
+    function blankRow(width) {
+        var row = [];
+        for (var i = 0; i < width; i++)
+            row.push((DEFAULT_ATTR << 8) | 0x20);
+        return row;
+    }
+    /** Interpret ANSI/CP437 bytes into a grid, wrapping at `width`. */
+    function render(art, width) {
+        var grid = { width: width, height: 0, rows: [] };
+        var x = 0;
+        var y = 0;
+        var attr = DEFAULT_ATTR;
+        var savedX = 0;
+        var savedY = 0;
+        function row(yy) {
+            while (grid.rows.length <= yy)
+                grid.rows.push(blankRow(width));
+            if (yy + 1 > grid.height)
+                grid.height = yy + 1;
+            return grid.rows[yy];
+        }
+        function put(ch) {
+            // Lazy wrap (last-column-flag semantics): a char written in the
+            // final column leaves the cursor "hanging" and only wraps when
+            // the NEXT printable arrives. Eager wrapping would double-space
+            // art whose rows end exactly at the wrap column before a CRLF.
+            if (x >= width) {
+                x = 0;
+                y++;
+            }
+            if (y >= MAX_ROWS)
+                return;
+            row(y)[x] = (attr << 8) | ch;
+            x++;
+        }
+        function sgr(params) {
+            var parts = params.length ? params.split(";") : ["0"];
+            for (var i = 0; i < parts.length; i++) {
+                var n = parts[i].length ? parseInt(parts[i], 10) : 0;
+                if (isNaN(n))
+                    continue;
+                if (n === 0)
+                    attr = DEFAULT_ATTR;
+                else if (n === 1)
+                    attr |= 0x08;
+                else if (n === 2 || n === 22)
+                    attr &= ~0x08;
+                else if (n === 5 || n === 6)
+                    attr |= 0x80;
+                else if (n === 25)
+                    attr &= ~0x80;
+                else if (n === 7)
+                    attr = ((attr & 0x07) << 4) | ((attr >> 4) & 0x07) | (attr & 0x88);
+                else if (n >= 30 && n <= 37)
+                    attr = (attr & 0xf8) | SGR_TO_CGA[n - 30];
+                else if (n === 39)
+                    attr = (attr & 0xf8) | 0x07;
+                else if (n >= 40 && n <= 47)
+                    attr = (attr & 0x8f) | (SGR_TO_CGA[n - 40] << 4);
+                else if (n === 49)
+                    attr = attr & 0x8f;
+            }
+        }
+        var i = 0;
+        var n = art.length;
+        while (i < n && y < MAX_ROWS) {
+            var c = art.charCodeAt(i) & 0xff;
+            if (c === 0x1b && i + 1 < n && art.charAt(i + 1) === "[") {
+                var j = i + 2;
+                var body = "";
+                while (j < n) {
+                    var cc = art.charAt(j);
+                    if (cc >= "@" && cc <= "~")
+                        break;
+                    body += cc;
+                    j++;
+                }
+                var fin = j < n ? art.charAt(j) : "";
+                i = j + 1;
+                var p1 = parseInt(body, 10);
+                if (isNaN(p1))
+                    p1 = 1;
+                if (fin === "m")
+                    sgr(body);
+                else if (fin === "C")
+                    x = Math.min(width - 1, x + Math.max(1, p1));
+                else if (fin === "D")
+                    x = Math.max(0, x - Math.max(1, p1));
+                else if (fin === "A")
+                    y = Math.max(0, y - Math.max(1, p1));
+                else if (fin === "B")
+                    y = Math.min(MAX_ROWS - 1, y + Math.max(1, p1));
+                else if (fin === "G")
+                    x = Math.max(0, Math.min(width - 1, p1 - 1));
+                else if (fin === "H" || fin === "f") {
+                    var seg = body.split(";");
+                    var rr = parseInt(seg[0], 10);
+                    var ccol = parseInt(seg[1], 10);
+                    y = Math.max(0, (isNaN(rr) ? 1 : rr) - 1);
+                    x = Math.max(0, Math.min(width - 1, (isNaN(ccol) ? 1 : ccol) - 1));
+                }
+                else if (fin === "J") {
+                    if (body === "2") {
+                        grid.rows = [];
+                        grid.height = 0;
+                        x = 0;
+                        y = 0;
+                    }
+                }
+                else if (fin === "K") {
+                    var r = row(y);
+                    for (var k = x; k < width; k++)
+                        r[k] = (attr << 8) | 0x20;
+                }
+                else if (fin === "s") {
+                    savedX = x;
+                    savedY = y;
+                }
+                else if (fin === "u") {
+                    x = savedX;
+                    y = savedY;
+                }
+                // anything else: ignored
+                continue;
+            }
+            i++;
+            if (c === 0x0d) {
+                x = 0;
+                continue;
+            }
+            if (c === 0x0a) {
+                x = 0;
+                y++;
+                continue;
+            }
+            if (c === 0x1a)
+                break; // EOF marker
+            if (c === 0x09) { // tab -> next 8-col stop
+                x = Math.min(width - 1, (Math.floor(x / 8) + 1) * 8);
+                continue;
+            }
+            if (c === 0x0c) { // FF -> clear
+                grid.rows = [];
+                grid.height = 0;
+                x = 0;
+                y = 0;
+                continue;
+            }
+            put(c);
+        }
+        return grid;
+    }
+    FLAnsiGrid.render = render;
+    /** Decode a 10x6 BIN avatar (char+attr pairs) into a grid. */
+    function renderBin(data, width, height) {
+        if (data.length < width * height * 2)
+            return null;
+        var grid = { width: width, height: height, rows: [] };
+        var p = 0;
+        for (var y = 0; y < height; y++) {
+            var row = [];
+            for (var x = 0; x < width; x++) {
+                var ch = data.charCodeAt(p++) & 0xff;
+                var at = data.charCodeAt(p++) & 0xff;
+                row.push((at << 8) | (ch === 0 ? 0x20 : ch));
+            }
+            grid.rows.push(row);
+        }
+        return grid;
+    }
+    FLAnsiGrid.renderBin = renderBin;
+    function rotateCga(idx, steps) {
+        for (var s = 0; s < steps; s++)
+            idx = HUE_NEXT[idx];
+        return idx;
+    }
+    function attrToSgr(attr, hueShift) {
+        var fg = rotateCga(attr & 0x07, hueShift);
+        var bg = rotateCga((attr >> 4) & 0x07, hueShift);
+        var out = "0";
+        if (attr & 0x08)
+            out += ";1";
+        if (attr & 0x80)
+            out += ";5";
+        out += ";" + CGA_TO_SGR[fg] + ";" + (CGA_TO_SGR[bg] + 10);
+        return out;
+    }
+    FLAnsiGrid.attrToSgr = attrToSgr;
+    /**
+     * Blit a window of the grid to the screen: source rows [srcRow, srcRow+nRows)
+     * and cols [srcCol, srcCol+nCols) drawn with the top-left at screen
+     * (top,left) (1-based). Emits minimal SGR runs; hueShift rotates colors.
+     */
+    function emit(grid, left, top, srcRow, nRows, srcCol, nCols, hueShift) {
+        var out = "";
+        var lastSgr = "";
+        for (var r = 0; r < nRows; r++) {
+            var gy = srcRow + r;
+            if (gy < 0 || gy >= grid.rows.length)
+                continue;
+            var row = grid.rows[gy];
+            out += "\x1b[" + (top + r) + ";" + left + "H";
+            for (var cIdx = 0; cIdx < nCols; cIdx++) {
+                var gx = srcCol + cIdx;
+                var cell = gx >= 0 && gx < row.length ? row[gx] : ((DEFAULT_ATTR << 8) | 0x20);
+                var code = attrToSgr(cell >> 8, hueShift);
+                if (code !== lastSgr) {
+                    out += "\x1b[" + code + "m";
+                    lastSgr = code;
+                }
+                out += String.fromCharCode(cell & 0xff);
+            }
+        }
+        return out + "\x1b[0m";
+    }
+    FLAnsiGrid.emit = emit;
+})(FLAnsiGrid || (FLAnsiGrid = {}));
+/*
  * FLPlayer — in-terminal MP3 playback for Futureland Records over the
  * SyncTERM APC audio protocol (APC SyncTERM:... ST), with album-art
- * backdrop, a counting-up progress overlay, and an audio-reactive
+ * backdrop, synced lyrics, floating avatar sprites, and an audio-reactive
  * visualizer driven by real per-chunk features (RMS loudness + zero
  * crossing rate) computed while slicing.
  *
@@ -772,6 +1022,14 @@ var FLRecordsData;
  * underrun -> re-anchor the clock and re-prime the cushion (the same
  * closed-loop recovery lameboy's apc_audio.rs uses); firing after the
  * last chunk means the song finished.
+ *
+ * Screen (bottom-anchored; art is grid-rendered, centered and trimmed):
+ *   1 .. H-8   album art (FLAnsiGrid) with floating avatar sprites
+ *   H-7        glow strip (audio-reactive)
+ *   H-6        synced lyric line
+ *   H-5        glow strip (mirror)
+ *   H-4..H-1   double-line box: title / progress+time+volume
+ *   H          key hints
  */
 var FLPlayer;
 (function (FLPlayer) {
@@ -785,6 +1043,9 @@ var FLPlayer;
     var UI_TICK_MS = 150; // overlay/visualizer repaint cadence
     var SEEK_SECONDS = 10;
     var VOLUME_STEP = 10; // percent per Up/Down press
+    var ART_WIDTH = 80; // classic ANSI art wrap column
+    var AVATAR_W = 10; // Synchronet avatar cell dimensions
+    var AVATAR_H = 6;
     var detectedSink = null; // per-session cache
     // ---- small helpers --------------------------------------------------
     function shellQuote(s) {
@@ -806,9 +1067,10 @@ var FLPlayer;
         console.write("\x1b_SyncTERM:" + payload + "\x1b\\");
     }
     // ---- WAV plumbing ---------------------------------------------------
-    // We always transcode to canonical PCM (pcm_s16le), so a fixed-layout
-    // header writer/parser is sufficient; parse still walks RIFF chunks in
-    // case ffmpeg adds a LIST before data.
+    // We always transcode to canonical PCM (pcm_s16le) with metadata
+    // stripped, so the header is the fixed 44 bytes; the parser still walks
+    // RIFF chunks and the reader grows its buffer, in case a pre-data chunk
+    // ever appears anyway.
     function le16(v) {
         return String.fromCharCode(v & 0xff, (v >> 8) & 0xff);
     }
@@ -1049,9 +1311,6 @@ var FLPlayer;
         return out.substr(0, count);
     }
     // ---- per-chunk audio features -----------------------------------------
-    // Stride-sampled from the slice we already hold for base64 encoding:
-    // ~256 sample points per chunk give a stable RMS (loudness) and zero
-    // crossing rate (brightness proxy) without measurable CPU cost.
     function chunkFeatures(slice, channels) {
         var frames = Math.floor(slice.length / (channels * 2));
         if (frames < 2)
@@ -1092,6 +1351,37 @@ var FLPlayer;
         return { rms: rms, zcr: zcr };
     }
     FLPlayer.chunkFeatures = chunkFeatures;
+    // ---- synced lyrics -------------------------------------------------------
+    /** Index of the lyric line active at `sec`, or -1. `fromIdx` makes the
+     *  common forward walk O(1); it resets automatically after a back-seek. */
+    function lyricIndexFor(lyrics, sec, fromIdx) {
+        if (!lyrics || !lyrics.length || sec < lyrics[0].time)
+            return -1;
+        var i = fromIdx >= 0 && fromIdx < lyrics.length && lyrics[fromIdx].time <= sec
+            ? fromIdx : 0;
+        while (i + 1 < lyrics.length && lyrics[i + 1].time <= sec)
+            i++;
+        return i;
+    }
+    FLPlayer.lyricIndexFor = lyricIndexFor;
+    /** Distribute untimed lyric text evenly across the song duration. */
+    function distributeLyrics(flat, totalSec) {
+        var lines = [];
+        var parts = String(flat || "").split("\n");
+        for (var i = 0; i < parts.length; i++) {
+            var t = parts[i].replace(/^\s+|\s+$/g, "");
+            if (t.length)
+                lines.push(t);
+        }
+        var out = [];
+        if (!lines.length || totalSec <= 0)
+            return out;
+        var span = totalSec / (lines.length + 1);
+        for (var j = 0; j < lines.length; j++)
+            out.push({ time: span * (j + 1), text: lines[j] });
+        return out;
+    }
+    FLPlayer.distributeLyrics = distributeLyrics;
     // ---- playback screen ----------------------------------------------------
     var CLR = "\x1b[0m";
     function sgr(codes) {
@@ -1102,7 +1392,7 @@ var FLPlayer;
     }
     function layout() {
         var cols = Math.max(40, console.screen_columns || 80);
-        var rows = Math.max(12, console.screen_rows || 24);
+        var rows = Math.max(14, console.screen_rows || 24);
         var width = Math.min(cols - 2, 76);
         return {
             cols: cols,
@@ -1110,18 +1400,73 @@ var FLPlayer;
             boxTop: rows - 4,
             boxLeft: Math.max(1, Math.floor((cols - width) / 2) + 1),
             boxWidth: width,
-            glowRow: rows - 5
+            glowRow1: rows - 7,
+            lyricRow: rows - 6,
+            glowRow2: rows - 5,
+            artTop: 1,
+            artBottom: rows - 8
         };
     }
-    function drawBackdrop(track, l) {
+    function makeArtBlit(track, l) {
+        var blit = {
+            grid: null, left: 1, top: l.artTop,
+            srcRow: 0, srcCol: 0, nRows: 0, nCols: 0, hue: 0
+        };
+        if (!track.ansiArt.length)
+            return blit;
+        var grid = FLAnsiGrid.render(FLAnsiGrid.stripSauce(track.ansiArt), ART_WIDTH);
+        if (!grid.height)
+            return blit;
+        var availRows = l.artBottom - l.artTop + 1;
+        var availCols = l.cols;
+        blit.grid = grid;
+        blit.nRows = Math.min(grid.height, availRows);
+        blit.nCols = Math.min(grid.width, availCols);
+        blit.srcRow = 0; // trim bottom overflow
+        blit.srcCol = Math.max(0, Math.floor((grid.width - blit.nCols) / 2));
+        blit.top = l.artTop + Math.max(0, Math.floor((availRows - blit.nRows) / 2));
+        blit.left = Math.max(1, Math.floor((availCols - blit.nCols) / 2) + 1);
+        return blit;
+    }
+    function drawArt(blit) {
+        if (!blit.grid)
+            return;
+        console.write(FLAnsiGrid.emit(blit.grid, blit.left, blit.top, blit.srcRow, blit.nRows, blit.srcCol, blit.nCols, blit.hue));
+    }
+    /** Restore the backdrop over a screen rect (art cells where the rect
+     *  overlaps the art blit; blanks elsewhere). */
+    function restoreRect(blit, l, x, y, w, h) {
+        var y0 = Math.max(l.artTop, y);
+        var y1 = Math.min(l.artBottom, y + h - 1);
+        var x0 = Math.max(1, x);
+        var x1 = Math.min(l.cols, x + w - 1);
+        if (y1 < y0 || x1 < x0)
+            return;
+        // Blank the whole rect first (cheap), then re-blit the overlapping
+        // slice of art on top; cells outside the art window stay blank.
+        var out = CLR;
+        var blank = repeatByte(" ", x1 - x0 + 1);
+        for (var r = y0; r <= y1; r++)
+            out += gotoRC(r, x0) + blank;
+        console.write(out);
+        if (!blit.grid)
+            return;
+        var ax0 = Math.max(x0, blit.left);
+        var ax1 = Math.min(x1, blit.left + blit.nCols - 1);
+        var ay0 = Math.max(y0, blit.top);
+        var ay1 = Math.min(y1, blit.top + blit.nRows - 1);
+        if (ax1 < ax0 || ay1 < ay0)
+            return;
+        console.write(FLAnsiGrid.emit(blit.grid, ax0, ay0, blit.srcRow + (ay0 - blit.top), ay1 - ay0 + 1, blit.srcCol + (ax0 - blit.left), ax1 - ax0 + 1, blit.hue));
+    }
+    function drawBackdrop(track, l, blit) {
         console.write(CLR + "\x1b[2J\x1b[H");
-        if (track.ansiArt.length) {
-            console.write(track.ansiArt);
-            console.write(CLR);
+        if (blit.grid) {
+            drawArt(blit);
         }
         else {
             // No embedded art: a dim generated backdrop so the box isn't lonely.
-            var mid = Math.max(2, Math.floor(l.rows / 2) - 3);
+            var mid = Math.max(2, Math.floor((l.artTop + l.artBottom) / 2) - 1);
             var t = track.title.length > l.cols - 4 ? track.title.substr(0, l.cols - 4) : track.title;
             var a = track.artist.length > l.cols - 4 ? track.artist.substr(0, l.cols - 4) : track.artist;
             console.write(gotoRC(mid, Math.max(1, Math.floor((l.cols - t.length) / 2))) +
@@ -1172,13 +1517,13 @@ var FLPlayer;
         var col = Math.max(1, l.boxLeft + Math.floor((l.boxWidth - hints.length) / 2));
         console.write(gotoRC(Math.min(l.rows, l.boxTop + 4), col) + sgr("0;30;1") + hints + CLR);
     }
-    // Audio-reactive glow strip: a mirrored bar of shade blocks whose reach
-    // follows loudness and whose color follows brightness (ZCR): bass-heavy
-    // reads red/magenta, bright reads cyan/white. Border pulses on beats.
+    // Audio-reactive glow strips flanking the lyric line: reach follows
+    // loudness, color follows brightness (ZCR): bass reads red/magenta,
+    // bright reads cyan/white.
     var VIS_MODES = ["glow", "glow+art", "border", "off"];
-    function drawGlow(l, rms, zcr, mode) {
-        if (mode === "off") {
-            console.write(gotoRC(l.glowRow, l.boxLeft) + repeatByte(" ", l.boxWidth));
+    function drawGlow(l, row, rms, zcr, on) {
+        if (!on) {
+            console.write(CLR + gotoRC(row, l.boxLeft) + repeatByte(" ", l.boxWidth));
             return;
         }
         var half = Math.floor(l.boxWidth / 2);
@@ -1196,35 +1541,108 @@ var FLPlayer;
         }
         var left = line.split("").reverse().join("");
         var strip = left + line + (l.boxWidth % 2 ? " " : "");
-        console.write(gotoRC(l.glowRow, l.boxLeft) + sgr(color) + strip.substr(0, l.boxWidth) + CLR);
+        console.write(gotoRC(row, l.boxLeft) + sgr(color) + strip.substr(0, l.boxWidth) + CLR);
     }
-    // ---- art color-pulse variants -----------------------------------------
-    // "Alpha color swap": rotate the chromatic SGR colors of the .ans art
-    // (30/37/38/39 and the grays stay put so structure survives), giving 2-3
-    // palette-shifted variants we can flash on beats. Built once per track.
-    var HUE_ROT = {
-        "31": "33", "33": "32", "32": "36", "36": "34", "34": "35", "35": "31",
-        "41": "43", "43": "42", "42": "46", "46": "44", "44": "45", "45": "41"
-    };
-    function rotateSgr(art) {
-        return art.replace(/\x1b\[([0-9;]*)m/g, function (whole, body) {
-            var parts = body.split(";");
-            for (var i = 0; i < parts.length; i++) {
-                var mapped = HUE_ROT[parts[i]];
-                if (mapped)
-                    parts[i] = mapped;
+    function drawLyric(l, text) {
+        var t = text.length > l.boxWidth - 2 ? text.substr(0, l.boxWidth - 5) + "..." : text;
+        var pad = l.boxWidth - t.length;
+        var lead = Math.floor(pad / 2);
+        console.write(gotoRC(l.lyricRow, l.boxLeft) + CLR +
+            repeatByte(" ", lead) + sgr("1;33") + t + CLR +
+            repeatByte(" ", pad - lead));
+    }
+    function makeSprites(track, l) {
+        var sprites = [];
+        var blobs = track.avatars || [];
+        var zoneW = l.cols;
+        var zoneH = l.artBottom - l.artTop + 1;
+        if (zoneW < AVATAR_W + 4 || zoneH < AVATAR_H + 2)
+            return sprites;
+        for (var i = 0; i < blobs.length && i < 2; i++) {
+            var grid = FLAnsiGrid.renderBin(blobs[i], AVATAR_W, AVATAR_H);
+            if (!grid)
+                continue;
+            sprites.push({
+                grid: grid,
+                x: i === 0 ? 3 : Math.max(3, zoneW - AVATAR_W - 2),
+                y: l.artTop + 1 + i * 2,
+                vx: (i % 2 === 0 ? 1 : -1) * 0.9,
+                vy: 0.35 * (i % 2 === 0 ? 1 : -1),
+                drawnX: -1,
+                drawnY: -1
+            });
+        }
+        return sprites;
+    }
+    function stepSprites(sprites, l, rms, beat) {
+        var minX = 1;
+        var maxX = l.cols - AVATAR_W + 1;
+        var minY = l.artTop;
+        var maxY = l.artBottom - AVATAR_H + 1;
+        if (maxX <= minX || maxY <= minY)
+            return;
+        var speed = 0.6 + rms * 1.8; // loudness drives the drift
+        var i;
+        for (i = 0; i < sprites.length; i++) {
+            var s = sprites[i];
+            if (beat) {
+                // Beat: a jolt — random kick plus a vertical jiggle.
+                s.vx += (Math.random() - 0.5) * 1.6;
+                s.vy += (Math.random() - 0.5) * 1.2;
             }
-            return "\x1b[" + parts.join(";") + "m";
-        });
+            // Clamp velocity so a pile of beats can't launch them.
+            s.vx = clamp(s.vx, -1.6, 1.6);
+            s.vy = clamp(s.vy, -1.1, 1.1);
+            s.x += s.vx * speed;
+            s.y += s.vy * speed;
+            if (s.x < minX) {
+                s.x = minX;
+                s.vx = Math.abs(s.vx);
+            }
+            if (s.x > maxX) {
+                s.x = maxX;
+                s.vx = -Math.abs(s.vx);
+            }
+            if (s.y < minY) {
+                s.y = minY;
+                s.vy = Math.abs(s.vy);
+            }
+            if (s.y > maxY) {
+                s.y = maxY;
+                s.vy = -Math.abs(s.vy);
+            }
+        }
+        // Pairwise collision: overlap -> swap velocities and separate.
+        for (i = 0; i + 1 < sprites.length; i++) {
+            var a = sprites[i];
+            var b = sprites[i + 1];
+            if (Math.abs(a.x - b.x) < AVATAR_W && Math.abs(a.y - b.y) < AVATAR_H) {
+                var tvx = a.vx;
+                a.vx = b.vx;
+                b.vx = tvx;
+                var tvy = a.vy;
+                a.vy = b.vy;
+                b.vy = tvy;
+                var push = a.x <= b.x ? 1 : -1;
+                a.x = clamp(a.x - push, minX, maxX);
+                b.x = clamp(b.x + push, minX, maxX);
+            }
+        }
     }
-    function buildArtVariants(art) {
-        if (!art.length)
-            return [];
-        var v1 = rotateSgr(art);
-        var v2 = rotateSgr(v1);
-        return [art, v1, v2];
+    function drawSprites(sprites, l, blit, force) {
+        for (var i = 0; i < sprites.length; i++) {
+            var s = sprites[i];
+            var nx = Math.round(s.x);
+            var ny = Math.round(s.y);
+            if (!force && nx === s.drawnX && ny === s.drawnY)
+                continue;
+            if (s.drawnX >= 0 && (nx !== s.drawnX || ny !== s.drawnY))
+                restoreRect(blit, l, s.drawnX, s.drawnY, AVATAR_W, AVATAR_H);
+            console.write(FLAnsiGrid.emit(s.grid, nx, ny, 0, AVATAR_H, 0, AVATAR_W, 0));
+            s.drawnX = nx;
+            s.drawnY = ny;
+        }
     }
-    FLPlayer.buildArtVariants = buildArtVariants;
     // ---- the player -----------------------------------------------------------
     function playTrack(track, statusLine) {
         var say = statusLine || function (msg) {
@@ -1274,18 +1692,31 @@ var FLPlayer;
         var volumePct = 80;
         var borderPulse = 0; // decaying beat flash
         var lastRms = 0;
-        var artVariants = buildArtVariants(track.ansiArt);
-        var artFlashIdx = 0;
-        var lastArtFlashAt = 0;
-        drawBackdrop(track, l);
+        var artHueFlashAt = 0;
+        var blit = makeArtBlit(track, l);
+        var sprites = makeSprites(track, l);
+        var lyrics = track.lyrics && track.lyrics.length
+            ? track.lyrics
+            : distributeLyrics(track.flatLyrics || "", totalSec);
+        var lyricIdx = -1;
+        drawBackdrop(track, l, blit);
         drawBoxFrame(l, "0;34");
         drawTitleLine(l, track);
         drawHints(l);
+        drawSprites(sprites, l, blit, true);
         apc("A;Volume;C=" + CHANNEL + ";V=" + volumePct);
         apc("A;Update;C=" + CHANNEL);
         var chunk = 0; // next chunk to emit
         var t0 = nowMs(); // wall-clock anchor: chunk i plays at t0 + i*CHUNK_MS
         var paused = false;
+        var pausedMs = 0; // frozen playhead while paused
+        // Any intentional Flush (track start counts: the PREVIOUS track's fade
+        // tail may still fire its armed notify) opens a grace window during
+        // which drain notifies are stale echoes of our own Flush, NOT
+        // underruns. Treating them as underruns re-Flushes, which fires the
+        // next notify: a restart ping-pong that scrubs the song back and forth.
+        var FLUSH_GRACE_MS = 1500;
+        var lastFlushAt = nowMs();
         var lastUiAt = 0;
         var result = "ended";
         var features = { rms: 0, zcr: 0 };
@@ -1308,12 +1739,13 @@ var FLPlayer;
         function rePrime(fromChunk) {
             chunk = clamp(fromChunk, 0, totalChunks);
             t0 = nowMs() - chunk * CHUNK_MS + PREBUFFER * CHUNK_MS;
+            lastFlushAt = nowMs();
             apc("A;Flush;C=" + CHANNEL);
             apc("A;Update;C=" + CHANNEL);
         }
         while (bbs.online && !js.terminated) {
             var now = nowMs();
-            var playMs = now - t0;
+            var playMs = paused ? pausedMs : (now - t0);
             var playChunk = clamp(Math.floor(playMs / CHUNK_MS), 0, totalChunks);
             if (!paused) {
                 // Top up the cushion: emit every chunk whose send-time has come.
@@ -1335,6 +1767,8 @@ var FLPlayer;
                 else if (k === " ") {
                     if (!paused) {
                         paused = true;
+                        pausedMs = playMs; // freeze the displayed clock
+                        lastFlushAt = now; // our Flush, not an underrun
                         apc("A;Flush;C=" + CHANNEL);
                         chunk = playChunk; // resume point
                     }
@@ -1353,13 +1787,12 @@ var FLPlayer;
                 }
                 else if (k === "V") {
                     visMode = (visMode + 1) % VIS_MODES.length;
-                    drawGlow(l, 0, 0, "off");
-                    if (artVariants.length && artFlashIdx !== 0) {
-                        artFlashIdx = 0;
-                        console.write(CLR + "\x1b[H" + artVariants[0] + CLR);
-                        drawBoxFrame(l, "0;34");
-                        drawTitleLine(l, track);
-                        drawHints(l);
+                    drawGlow(l, l.glowRow1, 0, 0, false);
+                    drawGlow(l, l.glowRow2, 0, 0, false);
+                    if (blit.grid && blit.hue !== 0) {
+                        blit.hue = 0;
+                        drawArt(blit);
+                        drawSprites(sprites, l, blit, true);
                     }
                 }
             }
@@ -1372,6 +1805,7 @@ var FLPlayer;
                         rePrime(Math.floor(target / CHUNK_MS));
                     else
                         chunk = clamp(Math.floor(target / CHUNK_MS), 0, totalChunks);
+                    lyricIdx = -1; // re-resolve after a seek (may be backwards)
                 }
                 else if (dir === "up" || dir === "down") {
                     volumePct = clamp(volumePct + (dir === "up" ? VOLUME_STEP : -VOLUME_STEP), 0, 100);
@@ -1384,6 +1818,13 @@ var FLPlayer;
                         // Armed notify after the last chunk: the song finished.
                         result = "ended";
                         quitReq = true;
+                    }
+                    else if (now - lastFlushAt < FLUSH_GRACE_MS) {
+                        // Stale echo of our own Flush (seek/pause/track start):
+                        // the one-shot was consumed by it, so just re-arm and
+                        // keep playing. Recovering here would re-Flush and
+                        // trigger the next echo — the restart ping-pong.
+                        apc("A;Update;C=" + CHANNEL);
                     }
                     else {
                         // Underrun: the cushion ran dry (slow link / stall).
@@ -1408,18 +1849,16 @@ var FLPlayer;
                 var mode = VIS_MODES[visMode];
                 var beat = !paused && features.rms > lastRms + 0.22;
                 if (beat)
-                    borderPulse = 3; // beat: flash the border
+                    borderPulse = 3;
                 lastRms = features.rms;
-                // Art color-pulse: on beats, redraw the art with a rotated
+                // Art color-pulse: on beats, re-blit the grid with a rotated
                 // palette (rate-capped so slow links keep breathing room).
-                if (mode === "glow+art" && beat && artVariants.length > 1 &&
-                    now - lastArtFlashAt > 450) {
-                    lastArtFlashAt = now;
-                    artFlashIdx = (artFlashIdx + 1) % artVariants.length;
-                    console.write(CLR + "\x1b[H" + artVariants[artFlashIdx] + CLR);
-                    drawBoxFrame(l, "0;34");
-                    drawTitleLine(l, track);
-                    drawHints(l);
+                if (mode === "glow+art" && beat && blit.grid &&
+                    now - artHueFlashAt > 450) {
+                    artHueFlashAt = now;
+                    blit.hue = (blit.hue + 1) % 3;
+                    drawArt(blit);
+                    drawSprites(sprites, l, blit, true);
                 }
                 if (mode !== "off" && borderPulse > 0) {
                     drawBoxFrame(l, borderPulse >= 2 ? "1;36" : "0;36");
@@ -1430,7 +1869,22 @@ var FLPlayer;
                         drawTitleLine(l, track);
                     }
                 }
-                drawGlow(l, paused ? 0 : features.rms, features.zcr, (mode === "glow" || mode === "glow+art") ? "glow" : "off");
+                var glowOn = mode === "glow" || mode === "glow+art";
+                drawGlow(l, l.glowRow1, paused ? 0 : features.rms, features.zcr, glowOn);
+                drawGlow(l, l.glowRow2, paused ? 0 : features.rms, features.zcr, glowOn);
+                // Floating avatars: physics every tick, redraw when they move.
+                if (sprites.length && !paused) {
+                    stepSprites(sprites, l, features.rms, beat);
+                    drawSprites(sprites, l, blit, false);
+                }
+                // Synced lyric line between the strips.
+                if (lyrics.length) {
+                    var li = lyricIndexFor(lyrics, playMs / 1000, lyricIdx);
+                    if (li !== lyricIdx) {
+                        lyricIdx = li;
+                        drawLyric(l, li >= 0 ? lyrics[li].text : "");
+                    }
+                }
                 drawProgress(l, clamp(playMs / 1000, 0, totalSec), totalSec, paused, volumePct);
                 console.write(gotoRC(l.rows, l.cols) + CLR);
             }
@@ -1457,16 +1911,6 @@ var FLPlayer;
             throw new Error("rate/channels mismatch: " + info.rate + "/" + info.channels);
         if (info.dataOffset !== 44 || info.dataBytes !== pcm.length)
             throw new Error("data chunk mismatch: " + info.dataOffset + "/" + info.dataBytes);
-        // Feature extraction: a loud sine has high RMS and some crossings;
-        // silence has neither.
-        var loud = chunkFeatures(pcm, 2);
-        if (!(loud.rms > 0.4))
-            throw new Error("sine rms too low: " + loud.rms);
-        if (!(loud.zcr > 0))
-            throw new Error("sine zcr zero");
-        var quiet = chunkFeatures(repeatByte("\x00", 4000), 2);
-        if (quiet.rms !== 0)
-            throw new Error("silence rms nonzero");
         // A WAV whose data chunk sits past 512 bytes (ffmpeg LIST INFO tags)
         // must still parse via the progressive reader's growth path.
         var fat = "RIFF" + le32(4 + 8 + 8 + 700 + 8 + pcm.length) + "WAVE" +
@@ -1484,15 +1928,68 @@ var FLPlayer;
             throw new Error("fat data offset wrong: " + fatInfo.dataOffset);
         if (fatInfo.dataBytes !== pcm.length)
             throw new Error("fat data bytes wrong");
-        // Art hue rotation: chromatic codes rotate, structure survives.
-        var art = "\x1b[1;31mRED\x1b[0;44;33mYB\x1b[37mW\x1b[m.";
-        var vars2 = buildArtVariants(art);
-        if (vars2.length !== 3)
-            throw new Error("variant count");
-        if (vars2[1] !== "\x1b[1;33mRED\x1b[0;45;32mYB\x1b[37mW\x1b[m.")
-            throw new Error("hue rotation wrong: " + vars2[1].replace(/\x1b/g, "^["));
-        if (vars2[1] === vars2[0] || vars2[2] === vars2[1] || vars2[2] === vars2[0])
-            throw new Error("variants not distinct");
+        // Feature extraction: a loud sine has high RMS and some crossings;
+        // silence has neither.
+        var loud = chunkFeatures(pcm, 2);
+        if (!(loud.rms > 0.4))
+            throw new Error("sine rms too low: " + loud.rms);
+        if (!(loud.zcr > 0))
+            throw new Error("sine zcr zero");
+        var quiet = chunkFeatures(repeatByte("\x00", 4000), 2);
+        if (quiet.rms !== 0)
+            throw new Error("silence rms nonzero");
+        // ANSI grid: SAUCE strip, wrap-at-width, SGR attrs, cursor-forward.
+        var sauced = "hello" + "\x1a" + repeatByte("\x00", 100) +
+            "SAUCE00" + repeatByte("z", 121);
+        if (FLAnsiGrid.stripSauce(sauced) !== "hello")
+            throw new Error("SAUCE strip failed");
+        var artSrc = "\x1b[1;31mAB\x1b[44m\x1b[3CC\r\nD";
+        var g = FLAnsiGrid.render(artSrc, 4);
+        if (g.height < 2)
+            throw new Error("grid height: " + g.height);
+        if ((g.rows[0][0] & 0xff) !== 65 || (g.rows[0][1] & 0xff) !== 66)
+            throw new Error("grid chars wrong");
+        var attrA = g.rows[0][0] >> 8;
+        if ((attrA & 0x0f) !== (0x08 | 4)) // bright red (CGA red=4)
+            throw new Error("grid attr wrong: " + attrA);
+        var attrC = g.rows[0][3] >> 8;
+        if (((attrC >> 4) & 0x07) !== 1) // blue bg (CGA blue=1)
+            throw new Error("grid bg wrong: " + attrC);
+        if ((g.rows[1][0] & 0xff) !== 68) // 'D' after CRLF
+            throw new Error("grid newline wrong");
+        // Wrap: 5 chars at width 4 flow onto row 1.
+        var g2 = FLAnsiGrid.render("ABCDE", 4);
+        if ((g2.rows[1][0] & 0xff) !== 69)
+            throw new Error("wrap failed");
+        // Emit: positions + chars + hue rotation changes output.
+        var em0 = FLAnsiGrid.emit(g2, 5, 3, 0, 1, 0, 4, 0);
+        if (em0.indexOf("\x1b[3;5H") !== 0)
+            throw new Error("emit origin wrong");
+        if (em0.indexOf("ABCD") < 0)
+            throw new Error("emit chars wrong");
+        var emRot = FLAnsiGrid.emit(g, 1, 1, 0, 1, 0, 4, 1);
+        var emPlain = FLAnsiGrid.emit(g, 1, 1, 0, 1, 0, 4, 0);
+        if (emRot === emPlain)
+            throw new Error("hue rotation is a no-op");
+        // BIN avatar decode: 10x6 cells, char+attr pairs.
+        var bin = "";
+        for (var bi = 0; bi < 60; bi++)
+            bin += String.fromCharCode(65 + (bi % 26)) + String.fromCharCode(0x1f);
+        var av = FLAnsiGrid.renderBin(bin, 10, 6);
+        if (!av || av.height !== 6 || (av.rows[0][0] & 0xff) !== 65)
+            throw new Error("renderBin failed");
+        // Lyrics: timed lookup walks forward and resets after a back-seek;
+        // distribution spaces untimed lines evenly.
+        var ly = [{ time: 5, text: "one" }, { time: 10, text: "two" }, { time: 20, text: "three" }];
+        if (lyricIndexFor(ly, 3, -1) !== -1)
+            throw new Error("lyric before-first wrong");
+        if (lyricIndexFor(ly, 12, 0) !== 1)
+            throw new Error("lyric walk wrong");
+        if (lyricIndexFor(ly, 6, 2) !== 0)
+            throw new Error("lyric back-seek wrong");
+        var dist = distributeLyrics("a\n\nb\nc", 40);
+        if (dist.length !== 3 || Math.abs(dist[0].time - 10) > 0.01)
+            throw new Error("lyric distribution wrong");
         // Base64 sanity over binary bytes.
         var rt = base64_decode(base64_encode(wav.substr(0, 200)));
         if (rt !== wav.substr(0, 200))
@@ -1553,7 +2050,7 @@ var FLPlayer;
             var tf = new File(wp);
             if (!tf.open("rb"))
                 throw new Error("cache open failed");
-            var inf = parseWavHeader(tf.read(512), tf.length);
+            var inf = readWavInfo(tf);
             if (!inf) {
                 tf.close();
                 throw new Error("ffmpeg WAV did not parse");
@@ -2573,6 +3070,143 @@ var FLPlayer;
         }
         return "Browser bridge unavailable.\n\nOpen this URL in the browser:\n" + relativeUrl;
     }
+    function loadSidecarSyncedLyrics(track) {
+        var out = [];
+        var lrcPath = track.path.replace(/\.mp3$/i, ".lrc");
+        if (!file_exists(lrcPath))
+            return out;
+        var file = new File(lrcPath);
+        if (!file.open("r"))
+            return out;
+        var raw;
+        try {
+            raw = file.read();
+        }
+        finally {
+            file.close();
+        }
+        raw = raw.replace(/\r/g, "");
+        var parts = raw.split("\n");
+        for (var i = 0; i < parts.length; i += 1) {
+            // A line may carry several [mm:ss.xx] tags (repeated chorus).
+            var text = trimValue(parts[i].replace(/\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]/g, ""));
+            if (!text.length)
+                continue;
+            var rx = /\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]/g;
+            var m;
+            while ((m = rx.exec(parts[i])) !== null) {
+                var frac = m[3] ? parseInt(m[3], 10) / Math.pow(10, m[3].length) : 0;
+                out.push({ time: parseInt(m[1], 10) * 60 + parseInt(m[2], 10) + frac, text: text });
+            }
+        }
+        out.sort(function (a, b) {
+            return a.time - b.time;
+        });
+        return out;
+    }
+    // AI co-writer avatars from the local-aidefinitions sub (same source the
+    // web records page uses): base64 10x6 BIN between avatar_data markers in
+    // each persona's thread-origin message body. Cached per session.
+    var cowriterAvatarCache = null;
+    function cowriterAvatars() {
+        if (cowriterAvatarCache !== null)
+            return cowriterAvatarCache;
+        var map = {};
+        var subCode = "local-aidefinitions";
+        if (!msg_area.sub[subCode]) {
+            cowriterAvatarCache = map;
+            return map;
+        }
+        try {
+            var msgBase = new MsgBase(subCode);
+            if (msgBase.open()) {
+                var headers = msgBase.get_all_msg_headers(true);
+                var origins = {};
+                for (var key in headers) {
+                    if (!headers.hasOwnProperty(key))
+                        continue;
+                    var header = headers[key];
+                    if (!header || (header.attr & MSG_DELETE))
+                        continue;
+                    if (!origins[safeString(header.thread_id)])
+                        origins[safeString(header.thread_id)] = header;
+                }
+                for (var tid in origins) {
+                    if (!origins.hasOwnProperty(tid))
+                        continue;
+                    var hdr = origins[tid];
+                    var name = trimValue(safeString(hdr.subject).replace(/^re:\s*/i, ""));
+                    if (!name.length)
+                        continue;
+                    try {
+                        var body = safeString(msgBase.get_msg_body(hdr.number));
+                        var m1 = body.indexOf("avatar_data_begin");
+                        var m2 = body.indexOf("avatar_data_end");
+                        if (m1 >= 0 && m2 > m1) {
+                            var b64 = body.substring(m1 + 17, m2).replace(/[\r\n\s]/g, "");
+                            if (b64.length)
+                                map[lower(name)] = b64;
+                        }
+                    }
+                    catch (ignored) { }
+                }
+                msgBase.close();
+            }
+        }
+        catch (err) {
+            log(LOG_WARNING, "fl_records cowriter avatar load failed: " + safeString(err));
+        }
+        cowriterAvatarCache = map;
+        return map;
+    }
+    // Resolve up to two 10x6 avatar BIN blobs for a track: split the artist
+    // on feat./separators, then try AI co-writers, then local BBS users.
+    function trackAvatars(track) {
+        var out = [];
+        var names = [];
+        var raw = trimValue(displayTrackArtist(track));
+        var parts = raw.split(/\s+feat\.?\s+|\s+featuring\s+|\s*[,&+]\s*|\s+x\s+/i);
+        for (var i = 0; i < parts.length; i++) {
+            var n = trimValue(parts[i]);
+            if (n.length)
+                names.push(n);
+        }
+        var comp = trimValue(track.composer);
+        if (comp.length)
+            names.push(comp);
+        var seen = {};
+        var aiMap = cowriterAvatars();
+        var avatarLib = null;
+        for (var j = 0; j < names.length && out.length < 2; j++) {
+            var keyName = lower(names[j]);
+            if (seen[keyName])
+                continue;
+            seen[keyName] = true;
+            var data = "";
+            if (aiMap[keyName]) {
+                data = aiMap[keyName];
+            }
+            else {
+                try {
+                    var un = system.matchuser(names[j]);
+                    if (un > 0) {
+                        if (avatarLib === null)
+                            avatarLib = load({}, "avatar_lib.js");
+                        var obj = avatarLib.read_localuser(un);
+                        if (obj && obj.data && !obj.disabled)
+                            data = safeString(obj.data);
+                    }
+                }
+                catch (ignored2) { }
+            }
+            if (data.length) {
+                var bin = base64_decode(data.replace(/[\r\n\s]/g, ""));
+                if (bin.length >= 120)
+                    out.push(bin);
+            }
+        }
+        return out;
+    }
     function playInTerminal(track, list, index) {
         withConsoleScreen(function () {
             console.clear();
@@ -2594,9 +3228,25 @@ var FLPlayer;
             while (bbs.online && !js.terminated) {
                 var cur = (list && list.length) ? list[idx] : track;
                 var parsed = parseTrackTags(cur.path, {
-                    includeLyrics: false,
+                    includeLyrics: true,
                     includeAnsiArt: true
                 });
+                // Timed lyrics: embedded SYLT first, then a timestamped .lrc
+                // sidecar; untimed text distributes evenly over the duration.
+                var timed = [];
+                if (parsed.syncedLyrics && parsed.syncedLyrics.length) {
+                    for (var si = 0; si < parsed.syncedLyrics.length; si++) {
+                        timed.push({
+                            time: parsed.syncedLyrics[si].time,
+                            text: toScreenText(parsed.syncedLyrics[si].text)
+                        });
+                    }
+                }
+                else {
+                    timed = loadSidecarSyncedLyrics(cur);
+                }
+                var flat = timed.length ? "" :
+                    toScreenText(trimValue(parsed.lyricsText || loadSidecarLyrics(cur)));
                 var playable = {
                     path: cur.path,
                     name: cur.name,
@@ -2604,7 +3254,10 @@ var FLPlayer;
                     mtime: cur.mtime,
                     title: toScreenText(displayTrackTitle(cur)),
                     artist: toScreenText(displayTrackArtist(cur)),
-                    ansiArt: parsed.ansiArtBase64.length ? base64_decode(parsed.ansiArtBase64) : ""
+                    ansiArt: parsed.ansiArtBase64.length ? base64_decode(parsed.ansiArtBase64) : "",
+                    lyrics: timed,
+                    flatLyrics: flat,
+                    avatars: trackAvatars(cur)
                 };
                 var outcome = FLPlayer.playTrack(playable);
                 // Jukebox flow: a song ending naturally advances to the next
