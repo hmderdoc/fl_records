@@ -4451,6 +4451,9 @@ var FLPlayer;
             var curList = (list && list.length) ? list : [track];
             var idx = typeof index === "number" ? Math.max(0, Math.min(index, curList.length - 1)) : 0;
             var currentPlaylist = playlistName || ""; // set when the queue is a playlist (enables [R]emove)
+            var history = []; // played indices, oldest-first: P returns to the REAL previous track
+            var bag = []; // shuffle deck: every queue track plays once before any repeats
+            seedBag(bag, curList.length, idx); // first cycle excludes the track already playing
             while (bbs.online && !js.terminated) {
                 var cur = curList[idx];
                 // Immediate feedback for the inter-track gap (tag parse +
@@ -4524,6 +4527,8 @@ var FLPlayer;
                         currentPlaylist = pick.playlist || "";
                         if (pick.playlist)
                             FLPlayer.shuffle = false; // play a playlist in its arranged order
+                        history = [];
+                        seedBag(bag, curList.length, idx); // fresh queue -> fresh history/shuffle cycle
                     }
                     console.clear();
                     continue;
@@ -4541,6 +4546,8 @@ var FLPlayer;
                             return; // playlist emptied -> leave
                         if (idx >= curList.length)
                             idx = 0;
+                        history = [];
+                        seedBag(bag, curList.length, idx); // indices shifted -> reset nav state
                     }
                     else {
                         console.clear();
@@ -4567,28 +4574,38 @@ var FLPlayer;
                     console.clear();
                     continue;
                 }
-                // Radio flow: songs advance continuously and WRAP so the station
-                // never stops; N/P (and Left/Right) move manually; Q/Esc exits.
-                // With shuffle on, a natural advance picks a random other track;
-                // an explicit N/P (extra != 0) still steps sequentially.
-                if (outcome === "next" || outcome === "ended") {
-                    if (FLPlayer.shuffle && extra === 0 && curList.length > 1) {
-                        var ni = idx;
-                        while (ni === idx)
-                            ni = Math.floor(Math.random() * curList.length);
-                        idx = ni;
+                // Radio flow: the station never stops. Shuffle uses a no-repeat
+                // "bag" -- every track in the queue plays once before any repeats
+                // (reshuffle at cycle end). `history` records the REAL play order
+                // so P returns to the actual previous track, not idx-1. N/P
+                // (and buffered presses via `extra`) step through this.
+                if (outcome === "next" || outcome === "ended" || outcome === "prev") {
+                    var moves = (outcome === "prev" ? -1 : 1) + extra;
+                    if (moves === 0)
+                        moves = (outcome === "prev" ? -1 : 1);
+                    var goBack = moves < 0;
+                    var steps = Math.abs(moves);
+                    for (var mv = 0; mv < steps; mv += 1) {
+                        if (goBack) {
+                            if (history.length)
+                                idx = history.pop();
+                            else if (!FLPlayer.shuffle)
+                                idx = (idx - 1 + curList.length) % curList.length;
+                            // shuffle with no history yet: stay on the current track
+                        }
+                        else {
+                            history.push(idx);
+                            if (history.length > 500)
+                                history.shift();
+                            if (FLPlayer.shuffle && curList.length > 1) {
+                                idx = shuffleNext(curList.length, idx, bag);
+                            }
+                            else {
+                                idx = (idx + 1) % curList.length;
+                            }
+                        }
                     }
-                    else {
-                        var target = idx + 1 + extra;
-                        idx = target >= curList.length ? 0 : (target < 0 ? 0 : target);
-                    }
-                    FLPlayer.dbg("advance -> idx=" + idx + (FLPlayer.shuffle ? " (shuffle)" : ""));
-                    continue;
-                }
-                if (outcome === "prev") {
-                    var back = idx - 1 + extra;
-                    idx = back < 0 ? curList.length - 1 : (back >= curList.length ? curList.length - 1 : back);
-                    FLPlayer.dbg("back -> idx=" + idx);
+                    FLPlayer.dbg("nav -> idx=" + idx + (FLPlayer.shuffle ? " (shuffle bag=" + bag.length + ")" : ""));
                     continue;
                 }
                 return;
@@ -4854,14 +4871,23 @@ var FLPlayer;
         }
         return out;
     }
+    function playlistContains(pl, trackName) {
+        for (var i = 0; i < pl.tracks.length; i += 1)
+            if (pl.tracks[i] === trackName)
+                return true;
+        return false;
+    }
     // Add one track to a playlist: pick an existing one or create a new one.
+    // Intelligent: playlists that already hold the song are marked, and adding
+    // again is a no-op with an "Already in" message (never a duplicate).
     function addToPlaylistFlow(trackName, trackTitle) {
         runUifcFlow(function () {
             var pls = loadPlaylists();
             var options = ["Back", "[+ Create New Playlist]"];
             for (var i = 0; i < pls.length; i += 1)
-                options.push(pls[i].name + "   (" + pls[i].tracks.length + ")");
-            uifc.help_text = "Add \"" + toScreenText(trackTitle) + "\" to a playlist. Choose one, or create a new playlist. Backspace/Esc/Back all close this.";
+                options.push(pls[i].name + "   (" + pls[i].tracks.length + ")" +
+                    (playlistContains(pls[i], trackName) ? "  - added" : ""));
+            uifc.help_text = "Add \"" + toScreenText(trackTitle) + "\" to a playlist. '- added' marks playlists it's already in. Choose one, create a new playlist, or Back/Backspace/Esc to close.";
             var choice = uifc.list(WIN_ESC | WIN_SAV | WIN_ACT, "Add to Playlist", options, new uifc.list.CTX());
             if (choice <= 0)
                 return; // Back (0) or Esc (<0)
@@ -4869,12 +4895,22 @@ var FLPlayer;
                 var name = promptInput("New playlist name", "", 60, K_EDIT);
                 if (name === null || !trimValue(name).length)
                     return;
+                var existing = findPlaylist(loadPlaylists(), trimValue(name));
+                if (existing && playlistContains(existing, trackName)) {
+                    uifc.msg("Already in \"" + existing.name + "\".");
+                    return;
+                }
                 plAddTrack(trimValue(name), trackName); // creates if new, dedupes
                 uifc.msg("Added to \"" + trimValue(name) + "\".");
                 return;
             }
-            plAddTrack(pls[choice - 2].name, trackName);
-            uifc.msg("Added to \"" + pls[choice - 2].name + "\".");
+            var target = pls[choice - 2];
+            if (playlistContains(target, trackName)) {
+                uifc.msg("Already in \"" + target.name + "\".");
+                return;
+            }
+            plAddTrack(target.name, trackName);
+            uifc.msg("Added to \"" + target.name + "\".");
         });
     }
     // Drag-to-reorder a playlist's songs (console-drawn). Enter grabs the
@@ -5844,6 +5880,33 @@ var FLPlayer;
         }
         return a;
     }
+    // No-repeat shuffle. `bag` = the tracks not yet played this cycle. Refill it
+    // with `seedBag`; on a fresh cycle it holds ALL tracks (each plays exactly
+    // once before any repeat). At session start we seed it EXCEPT the track
+    // already playing, so that first cycle is clean too.
+    function seedBag(bag, len, except) {
+        bag.length = 0;
+        for (var i = 0; i < len; i += 1)
+            if (i !== except)
+                bag.push(i);
+        for (var j = bag.length - 1; j > 0; j -= 1) {
+            var k = Math.floor(Math.random() * (j + 1));
+            var t = bag[j];
+            bag[j] = bag[k];
+            bag[k] = t;
+        }
+    }
+    function shuffleNext(len, cur, bag) {
+        if (!bag.length)
+            seedBag(bag, len, -1); // new cycle: every track
+        var next = bag.pop();
+        if (next === cur && bag.length) { // avoid a back-to-back repeat at a cycle edge
+            var alt = bag.pop();
+            bag.push(next);
+            next = alt;
+        }
+        return next;
+    }
     // No terminal audio sink: the radio can't play, so let the caller browse the
     // catalog and open details / play-in-browser. Esc from the browser leaves.
     function noAudioFallback(app) {
@@ -5949,10 +6012,39 @@ var FLPlayer;
             throw new Error("delete failed");
         writeln("playlist self-test: OK");
     }
+    // No-repeat shuffle: every queue track must play before any repeats, and a
+    // track never lands twice in a row.
+    function shuffleSelfTest() {
+        var len = 7;
+        var bag = [];
+        var cur = 0;
+        seedBag(bag, len, cur); // first cycle excludes the starting track
+        var seen = {};
+        seen[cur] = true;
+        var seenCount = 1;
+        for (var s = 0; s < len * 5; s += 1) {
+            var nxt = shuffleNext(len, cur, bag);
+            if (nxt === cur)
+                throw new Error("shuffle immediate repeat");
+            if (seen[nxt]) {
+                if (seenCount !== len)
+                    throw new Error("shuffle repeated after " + seenCount + "/" + len + " (not exhausted)");
+                seen = {};
+                seenCount = 0;
+            }
+            if (!seen[nxt]) {
+                seen[nxt] = true;
+                seenCount += 1;
+            }
+            cur = nxt;
+        }
+        writeln("shuffle self-test: OK");
+    }
     function main() {
         if (typeof argv !== "undefined" && argv && argv.indexOf("--selftest") >= 0) {
             sanitizerSelfTest();
             playlistSelfTest();
+            shuffleSelfTest();
             FLPlayer.selfTest();
             return;
         }
