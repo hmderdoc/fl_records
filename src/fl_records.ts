@@ -128,6 +128,9 @@ interface AppState {
     // Sentinel returned by uifc.list when a caller-defined hotkey is pressed
     // (distinct from a row index >= 0 and from Esc's -1).
     var UI_ACTION_DETAIL = -2;
+    // The single app state, so the in-player Browse/Create actions can reach the
+    // catalog and compose flow without threading it through every call.
+    var activeApp: AppState;
     var CACHE_FILE = "catalog-cache.json";
 
     var uiReady = false;
@@ -1373,9 +1376,10 @@ interface AppState {
             }
             console.writeln("Audio sink: " + (sink === "syncterm" ? "SyncTERM (libsndfile)" : "APC bridge"));
 
-            var idx = typeof index === "number" ? index : 0;
+            var curList = (list && list.length) ? list : [track];
+            var idx = typeof index === "number" ? Math.max(0, Math.min(index, curList.length - 1)) : 0;
             while (bbs.online && !js.terminated) {
-                var cur = (list && list.length) ? list[idx] : track;
+                var cur = curList[idx];
                 // Immediate feedback for the inter-track gap (tag parse +
                 // possible transcode): a visible loading banner, so nobody
                 // double-presses N thinking the first one was ignored.
@@ -1435,23 +1439,37 @@ interface AppState {
                 }
                 if (quitBuffered)
                     return;
-                // Jukebox flow: a song ending naturally advances to the next
-                // track in the filtered list; N/P move manually; Q/Esc exits.
+                if (outcome === "browse") {
+                    // Typeahead browser: picking sets a new play queue (the
+                    // filtered results); cancelling replays the current track.
+                    var pick = browseSongs(activeApp);
+                    if (pick && pick.list.length) {
+                        curList = pick.list;
+                        idx = Math.max(0, Math.min(pick.index, curList.length - 1));
+                    }
+                    console.clear();
+                    continue;
+                }
+                if (outcome === "create") {
+                    // Compose is a uifc flow; bring the UI up just for it, then
+                    // drop back to the console-mode player.
+                    initUi();
+                    composeMenu(activeApp);
+                    safeBailUi();
+                    console.clear();
+                    continue;
+                }
+                // Radio flow: songs advance continuously and WRAP so the station
+                // never stops; N/P (and Left/Right) move manually; Q/Esc exits.
                 if (outcome === "next" || outcome === "ended") {
-                    if (!list || !list.length)
-                        return;
                     var target = idx + 1 + extra;
-                    if (target >= list.length)
-                        return;
-                    idx = target < 0 ? 0 : target;
+                    idx = target >= curList.length ? 0 : (target < 0 ? 0 : target);
                     FLPlayer.dbg("advance -> idx=" + idx);
                     continue;
                 }
                 if (outcome === "prev") {
-                    if (!list || !list.length)
-                        return;
                     var back = idx - 1 + extra;
-                    idx = back < 0 ? 0 : (back >= list.length ? list.length - 1 : back);
+                    idx = back < 0 ? curList.length - 1 : (back >= curList.length ? curList.length - 1 : back);
                     FLPlayer.dbg("back -> idx=" + idx);
                     continue;
                 }
@@ -1501,6 +1519,111 @@ interface AppState {
                 }
             }
         });
+    }
+
+    // --- console drawing helpers for the typeahead browser -----------------
+    function csiAt(y: number, x: number): string { return "\x1b[" + y + ";" + x + "H"; }
+    function csiSgr(codes: string): string { return "\x1b[" + codes + "m"; }
+    var CSI_RESET = "\x1b[0m";
+
+    function padClip(text: string, width: number): string {
+        if (width <= 0) return "";
+        if (text.length >= width) return text.substring(0, width);
+        return padRight(text, width);
+    }
+
+    // Typeahead song browser. Live-filters the catalog as you type; ALL printable
+    // keys feed the search (so commands must be non-letters: Enter plays, Tab
+    // shows details, Backspace deletes, Esc clears then backs out). Returns the
+    // filtered list + chosen index (which becomes the new play queue) or null.
+    // Console-drawn; input flows through the shared pump — never a raw inkey
+    // read, which would bisect in-flight sequences (see the input lesson).
+    function browseSongs(app: AppState): { list: TrackSummary[]; index: number } | null {
+        var result: { list: TrackSummary[]; index: number } | null = null;
+        withConsoleScreen(function (): void {
+            var search = "";
+            var sel = 0;
+            var top = 0;
+            var lastCols = 0;
+            var lastRows = 0;
+            var filtered: TrackSummary[] = [];
+            var full = true;
+            var dirty = true;
+            var done = false;
+
+            function recompute(): void {
+                filtered = [];
+                for (var i = 0; i < app.catalog.length; i += 1) {
+                    if (!search.length || trackSearchHaystack(app.catalog[i]).indexOf(search) >= 0)
+                        filtered.push(app.catalog[i]);
+                }
+                if (sel >= filtered.length) sel = filtered.length - 1;
+                if (sel < 0) sel = 0;
+                top = 0;
+            }
+            recompute();
+
+            while (!done && bbs.online && !js.terminated) {
+                var cols = Math.max(40, console.screen_columns || 80);
+                var rows = Math.max(10, console.screen_rows || 24);
+                if (cols !== lastCols || rows !== lastRows) { full = true; lastCols = cols; lastRows = rows; }
+                var listTop = 4;
+                var listH = Math.max(1, rows - listTop);
+                if (sel < top) top = sel;
+                if (sel >= top + listH) top = sel - listH + 1;
+                if (top < 0) top = 0;
+
+                if (full) { console.write("\x1b[?25l\x1b[2J"); full = false; dirty = true; }
+                if (dirty) {
+                    console.write(csiAt(1, 1) + csiSgr("0;1;36") +
+                        padClip(" FUTURELAND RECORDS  --  Browse", cols) + CSI_RESET);
+                    var count = " " + filtered.length + "/" + app.catalog.length + " ";
+                    console.write(csiAt(2, 1) + csiSgr("0;1;37") +
+                        padClip(" Search: " + search + "_", Math.max(0, cols - count.length)) +
+                        csiSgr("0;1;36") + count + CSI_RESET);
+                    console.write(csiAt(3, 1) + csiSgr("0;30;46") +
+                        padClip("  ENTER play    TAB details    BKSP clear    ESC back  ", cols) + CSI_RESET);
+                    for (var r = 0; r < listH; r += 1) {
+                        var idx = top + r;
+                        var y = listTop + r;
+                        var w = (y >= rows) ? cols - 1 : cols;   // never write the bottom-right cell
+                        var txt = idx < filtered.length ? trackRow(filtered[idx]) :
+                            (idx === 0 && !filtered.length ? "  (no matches - Backspace to widen)" : "");
+                        var on = idx === sel && filtered.length > 0;
+                        console.write(csiAt(y, 1) + csiSgr(on ? "0;37;44" : "0;37") + padClip(txt, w) + CSI_RESET);
+                    }
+                    dirty = false;
+                }
+
+                var ev = FLPlayer.pumpShared(120);
+                if (ev.esc || ev.keys.length || ev.arrows.length) dirty = true;
+                if (ev.esc) {
+                    if (search.length) { search = ""; sel = 0; recompute(); }
+                    else done = true;
+                }
+                for (var ki = 0; ki < ev.keys.length && !done; ki += 1) {
+                    var k = ev.keys[ki];
+                    if (k === "\r" || k === "\n") {
+                        if (filtered.length) { result = { list: filtered, index: sel }; done = true; }
+                    } else if (k === "\x08" || k === "\x7f") {
+                        if (search.length) { search = search.substring(0, search.length - 1); sel = 0; recompute(); }
+                    } else if (k === "\t") {
+                        if (filtered.length) { showTrackDetail(filtered[sel], filtered, sel); full = true; }
+                    } else if (k.length === 1 && k >= " " && k <= "~") {
+                        search += k.toLowerCase(); sel = 0; recompute();
+                    }
+                }
+                for (var ai = 0; ai < ev.arrows.length; ai += 1) {
+                    var d = ev.arrows[ai];
+                    if (d === "up") sel = sel > 0 ? sel - 1 : Math.max(0, filtered.length - 1);
+                    else if (d === "down") sel = filtered.length ? (sel + 1) % filtered.length : 0;
+                    else if (d === "left") sel = Math.max(0, sel - listH);
+                    else if (d === "right") sel = Math.min(Math.max(0, filtered.length - 1), sel + listH);
+                }
+            }
+            console.write("\x1b[?25h" + CSI_RESET);
+        });
+        return result;
     }
 
     function browseTracks(app: AppState): void {
@@ -2136,44 +2259,56 @@ interface AppState {
         }
     }
 
-    function comingSoonPlaylists(): void {
-        uifc.msg([
-            "Playlists arrive in the next update.",
-            "",
-            "Playlists you build on the web are saved in your",
-            "browser, so the door can't read them yet. The next",
-            "version adds a shared playlist store the web player",
-            "and the BBS both use."
-        ].join("\n"));
+    function shuffledCatalog(app: AppState): TrackSummary[] {
+        var a = app.catalog.slice();
+        for (var i = a.length - 1; i > 0; i -= 1) {
+            var j = Math.floor(Math.random() * (i + 1));
+            var t = a[i]; a[i] = a[j]; a[j] = t;
+        }
+        return a;
     }
 
-    function mainMenu(app: AppState): void {
-        var choice: number;
-        while (bbs.online && !js.terminated) {
-            uifc.help_text = "All Songs browses and plays the catalog. Create Song builds a prompt for Vektrax.";
-            choice = uifc.list(
-                WIN_ESC | WIN_SAV | WIN_ACT,
-                APP_TITLE,
-                [
-                    "All Songs          " + app.catalog.length + " tracks",
-                    "Select Playlist    (coming soon)",
-                    "Create Song",
-                    "Refresh Catalog Cache",
-                    "Quit"
-                ],
-                app.mainMenuCtx
-            );
-            if (choice < 0 || choice === 4) return;
-            if (choice === 0) {
-                browseTracks(app);
-            } else if (choice === 1) {
-                comingSoonPlaylists();
-            } else if (choice === 2) {
-                composeMenu(app);
-            } else if (choice === 3) {
-                app.catalog = loadCatalog(true);
-            }
+    // No terminal audio sink: the radio can't play, so let the caller browse the
+    // catalog and open details / play-in-browser. Esc from the browser leaves.
+    function noAudioFallback(app: AppState): void {
+        withConsoleScreen(function (): void {
+            console.clear();
+            printConsoleHeader(APP_TITLE);
+            console.writeln("");
+            console.writeln("  No terminal audio sink was detected.");
+            console.writeln("");
+            console.writeln("  In-terminal playback needs a current SyncTERM (APC audio)");
+            console.writeln("  or the BBSproxy shim. You can still browse the catalog and");
+            console.writeln("  use [P] Play In Browser from a song's details.");
+            console.writeln("");
+            console.writeln("  Press any key to browse...");
+            waitForAnyKey();
+        });
+        for (; ;) {
+            if (!bbs.online || js.terminated) return;
+            var pick = browseSongs(app);
+            if (!pick) return;
+            showTrackDetail(pick.list[pick.index], pick.list, pick.index);
         }
+    }
+
+    // "Tune In": the door opens straight into the visualizer with music playing
+    // (a shuffle of the whole catalog). Browse (B) and Create (C) are reachable
+    // from inside the player; with no audio sink we drop to browse-only.
+    function tuneIn(app: AppState): void {
+        var sink: string = "none";
+        withConsoleScreen(function (): void {
+            console.clear();
+            console.writeln("");
+            console.writeln("  Tuning in to Futureland Records...");
+            sink = FLPlayer.detectSink();
+        });
+        if (sink === "none" || !app.catalog.length) {
+            noAudioFallback(app);
+            return;
+        }
+        var list = shuffledCatalog(app);
+        playInTerminal(list[0], list, 0);
     }
 
     // Regression guard for the CP437 artist-name corruption: the real tag
@@ -2214,11 +2349,13 @@ interface AppState {
             return;
         }
         var app = createAppState();
+        activeApp = app;
         try {
             app.catalog = loadCatalog(false);
             app.cowriters = loadCowriters();
-            initUi();
-            mainMenu(app);
+            // Tune In: straight into the radio (console-mode player). uifc is
+            // only brought up on demand for Create / no-audio browse.
+            tuneIn(app);
         } catch (err) {
             safeBailUi();
             console.clear();

@@ -86,7 +86,7 @@ namespace FLPlayer {
         avatars?: string[];     // raw 10x6 BIN blobs (decoded), up to 2
     }
 
-    export type PlayResult = "quit" | "next" | "prev" | "ended" | "error";
+    export type PlayResult = "quit" | "next" | "prev" | "ended" | "error" | "browse" | "create";
 
     // ---- small helpers --------------------------------------------------
     function shellQuote(s: string): string {
@@ -336,6 +336,21 @@ namespace FLPlayer {
                     return;
                 }
                 this.escAt = 0;       // ESC got a continuation: a real sequence
+                // SS3 / application-cursor arrows: ESC O A/B/C/D. Some SyncTERM
+                // modes send these instead of CSI ESC[A; without this they fell
+                // through as a bare Esc (= quit) plus a stray letter.
+                if (this.buf.charAt(1) === "O") {
+                    if (this.buf.length < 3)
+                        return;           // wait for the final byte (may be split)
+                    var ss3 = this.buf.charAt(2);
+                    if (ss3 >= "A" && ss3 <= "D") {
+                        res.arrows.push(ss3 === "A" ? "up" : ss3 === "B" ? "down" :
+                            ss3 === "C" ? "right" : "left");
+                        this.buf = this.buf.substr(3);
+                        continue;
+                    }
+                    // ESC O <other>: not an arrow, fall through to Esc handling.
+                }
                 if (this.buf.charAt(1) !== "[") {
                     res.esc = true;       // ESC + non-CSI: treat as Esc, re-scan rest
                     this.buf = this.buf.substr(1);
@@ -734,9 +749,11 @@ namespace FLPlayer {
     function drawHints(l: Layout): void {
         // ASCII only: CP437 arrow glyphs live at C0 control positions (0x1B is
         // ESC!) and cannot be sent raw without corrupting the terminal state.
-        var hints = "[Space]Pause  [< >]Seek  [Up/Dn]Vol  [N/P]Track  [V]iz [B]g  [Q]uit";
+        var hints = "[Space]Pause  [+/-]Vol  [N/P]Track  [B]rowse  [C]reate  [Q]uit";
         if (hints.length > l.boxWidth)
-            hints = "[Spc]Pse [</>]Seek [N/P]Trk [Q]uit";
+            hints = "[Spc]Pse [+/-]Vol [N/P]Trk [B]rowse [Q]uit";
+        if (hints.length > l.boxWidth)
+            hints = "[Spc][+/-][N/P][B][Q]";
         var col = Math.max(1, l.boxLeft + Math.floor((l.boxWidth - hints.length) / 2));
         console.write(gotoRC(Math.min(l.rows, l.boxTop + 4), col) + sgr("0;30;1") + hints + CLR);
     }
@@ -1322,6 +1339,13 @@ namespace FLPlayer {
             redrawAll();
         }
 
+        function setVolume(pct: number): void {
+            volumePct = clamp(pct, 0, 100);
+            // ;T ramps smoothly; the on-screen "vol" indicator refreshes on the
+            // next UI tick. Canonical APC volume is 0-100 linear percent.
+            apc("A;Volume;C=" + CHANNEL + ";V=" + volumePct + ";T=120");
+        }
+
         // Drop input that leaked in before this track took the keyboard
         // (auto-repeat dregs; buffered intent was already honored by the
         // caller between tracks). This MUST go through the pump, not raw
@@ -1427,40 +1451,31 @@ namespace FLPlayer {
                 } else if (k === "P") {
                     result = "prev";
                     quitReq = true;
-                } else if (k === "V") {
-                    visMode = (visMode + 1) % VIS_MODES.length;
-                    drawGlow(l, l.glowRow1, 0, 0, false);
-                    drawGlow(l, l.glowRow2, 0, 0, false);
-                    if (blit.grid && blit.pal !== 0) {
-                        blit.pal = 0;
-                        palStep = 0;
-                        drawArt(blit);
-                        drawSprites(sprites, l, blit, true);
-                    }
                 } else if (k === "B") {
-                    bgMode = (bgMode + 1) % BG_MODES.length;
-                    strobeLevel = 0;
-                    rings = [];
-                    drawStrobe(margins, 0, 0);   // clear the margins
-                    checkerDirty = true;
-                    drawHints(l);
-                    if (lyricIdx >= 0 && lyrics.length)
-                        drawLyric(l, lyrics[lyricIdx].text, lyricColor, 1);
+                    result = "browse";       // open the typeahead song browser
+                    quitReq = true;
+                } else if (k === "C") {
+                    result = "create";       // jump to the compose-a-song flow
+                    quitReq = true;
+                } else if (k === "+" || k === "=") {
+                    setVolume(volumePct + VOLUME_STEP);
+                } else if (k === "-" || k === "_") {
+                    setVolume(volumePct - VOLUME_STEP);
                 }
             }
             for (var a = 0; a < ev.arrows.length; a++) {
                 var dir = ev.arrows[a];
-                if (dir === "left" || dir === "right") {
-                    var delta = (dir === "left" ? -SEEK_SECONDS : SEEK_SECONDS) * 1000;
-                    var target = clamp(playMs + delta, 0, Math.max(0, (totalChunks - 1) * CHUNK_MS));
-                    if (!paused)
-                        rePrime(Math.floor(target / CHUNK_MS));
-                    else
-                        chunk = clamp(Math.floor(target / CHUNK_MS), 0, totalChunks);
-                    lyricIdx = -1;   // re-resolve after a seek (may be backwards)
-                } else if (dir === "up" || dir === "down") {
-                    volumePct = clamp(volumePct + (dir === "up" ? VOLUME_STEP : -VOLUME_STEP), 0, 100);
-                    apc("A;Volume;C=" + CHANNEL + ";V=" + volumePct + ";T=120");
+                // Arrows mirror the reliable keys: Up/Dn volume, Left/Right track.
+                if (dir === "up") {
+                    setVolume(volumePct + VOLUME_STEP);
+                } else if (dir === "down") {
+                    setVolume(volumePct - VOLUME_STEP);
+                } else if (dir === "left") {
+                    result = "prev";
+                    quitReq = true;
+                } else if (dir === "right") {
+                    result = "next";
+                    quitReq = true;
                 }
             }
             for (var e = 0; e < ev.audio.length; e++) {
@@ -1813,6 +1828,26 @@ namespace FLPlayer {
         (p as any).buf = "\x1b";
         (p as any).drain(res, true);
         if (!res.esc) throw new Error("aged lone ESC did not resolve");
+
+        // SS3 / application-cursor arrows (ESC O A..D): decode as arrows, never
+        // as a bare Esc plus a stray letter. Also: a split SS3 must wait, not
+        // mis-fire.
+        var pSS3 = new InputPump();
+        var rSS3: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        (pSS3 as any).buf = "\x1bOA\x1bOB\x1bOC\x1bOD";
+        (pSS3 as any).drain(rSS3, true);
+        if (rSS3.arrows.join(",") !== "up,down,right,left")
+            throw new Error("SS3 arrow parse: " + rSS3.arrows.join(","));
+        if (rSS3.esc || rSS3.keys.length) throw new Error("SS3 arrows leaked esc/keys");
+        var pSS3s = new InputPump();
+        var rSS3s: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        (pSS3s as any).buf = "\x1bO";
+        (pSS3s as any).drain(rSS3s, true);
+        if (rSS3s.esc || rSS3s.arrows.length) throw new Error("partial SS3 resolved too eagerly");
+        (pSS3s as any).buf += "A";
+        (pSS3s as any).drain(rSS3s, true);
+        if (rSS3s.arrows.length !== 1 || rSS3s.arrows[0] !== "up")
+            throw new Error("split SS3 did not resolve to up");
 
         // The killer case: an audio notify split right after its ESC byte
         // must NOT become Esc + plain chars (the phantom 'N' bug).
