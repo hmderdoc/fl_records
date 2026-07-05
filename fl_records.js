@@ -833,6 +833,24 @@ var FLPlayer;
             "data" + le32(dataBytes);
     }
     FLPlayer.wavHeader = wavHeader;
+    /** Parse the header, growing the read until the data chunk is in view
+     *  (metadata LIST chunks can push it well past 512 bytes). */
+    function readWavInfo(f) {
+        var want = 512;
+        for (;;) {
+            f.position = 0;
+            var head = f.read(want);
+            if (!head || head.length < 44)
+                return null;
+            var info = parseWavHeader(head, f.length);
+            if (info)
+                return info;
+            if (head.length < want || want >= 65536)
+                return null; // whole file scanned (or cap hit): truly bad
+            want *= 4;
+        }
+    }
+    FLPlayer.readWavInfo = readWavInfo;
     function parseWavHeader(head, fileLength) {
         if (head.length < 44 || head.substr(0, 4) !== "RIFF" || head.substr(8, 4) !== "WAVE")
             return null;
@@ -874,13 +892,17 @@ var FLPlayer;
     /** Transcode (once) to the canonical low-rate WAV; returns its path or null. */
     function ensureTranscoded(track) {
         var key = md5_calc(track.name + ":" + track.size + ":" + track.mtime +
-            ":" + PCM_RATE + "x" + PCM_CHANNELS, true);
+            ":v2:" + PCM_RATE + "x" + PCM_CHANNELS, true);
         var out = pcmDir() + "/" + key + ".wav";
         if (file_exists(out) && file_size(out) > 44)
             return out;
         if (!mkpath(pcmDir()))
             return null;
+        // -map_metadata -1 + -bitexact: no RIFF LIST/INFO chunks, so the
+        // header is the canonical 44 bytes (a fat ID3 comment once pushed the
+        // data chunk past the header read and broke playback).
         var cmd = "ffmpeg -v quiet -y -i " + shellQuote(track.path) +
+            " -map_metadata -1 -bitexact" +
             " -ar " + PCM_RATE + " -ac " + PCM_CHANNELS +
             " -c:a pcm_s16le -f wav " + shellQuote(out) + " </dev/null";
         system.exec(cmd);
@@ -1226,8 +1248,7 @@ var FLPlayer;
         if (!f.open("rb"))
             return "error";
         try {
-            var head = f.read(512);
-            var info = parseWavHeader(head, f.length);
+            var info = readWavInfo(f);
             if (!info || !info.dataBytes) {
                 say("Bad PCM cache file.");
                 mswait(1500);
@@ -1446,6 +1467,23 @@ var FLPlayer;
         var quiet = chunkFeatures(repeatByte("\x00", 4000), 2);
         if (quiet.rms !== 0)
             throw new Error("silence rms nonzero");
+        // A WAV whose data chunk sits past 512 bytes (ffmpeg LIST INFO tags)
+        // must still parse via the progressive reader's growth path.
+        var fat = "RIFF" + le32(4 + 8 + 8 + 700 + 8 + pcm.length) + "WAVE" +
+            "fmt " + le32(16) + le16(1) + le16(2) + le32(22050) +
+            le32(22050 * 4) + le16(4) + le16(16) +
+            "LIST" + le32(700) + repeatByte("x", 700) +
+            "data" + le32(pcm.length) + pcm;
+        var fatInfo = parseWavHeader(fat.substr(0, 512), fat.length);
+        if (fatInfo !== null)
+            throw new Error("512-byte read should NOT see data yet");
+        fatInfo = parseWavHeader(fat.substr(0, 2048), fat.length);
+        if (!fatInfo)
+            throw new Error("fat header did not parse");
+        if (fatInfo.dataOffset !== 12 + 24 + 8 + 700 + 8)
+            throw new Error("fat data offset wrong: " + fatInfo.dataOffset);
+        if (fatInfo.dataBytes !== pcm.length)
+            throw new Error("fat data bytes wrong");
         // Art hue rotation: chromatic codes rotate, structure survives.
         var art = "\x1b[1;31mRED\x1b[0;44;33mYB\x1b[37mW\x1b[m.";
         var vars2 = buildArtVariants(art);
