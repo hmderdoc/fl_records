@@ -124,7 +124,7 @@ interface AppState {
     var APP_TITLE = "Futureland Records";
     var DIR_CODE = "originalcontent_mp3s";
     var CHAT_CHANNEL = "main";
-    var CACHE_VERSION = 1;
+    var CACHE_VERSION = 2;
     var CACHE_FILE = "catalog-cache.json";
 
     var uiReady = false;
@@ -690,11 +690,11 @@ interface AppState {
             size: cached.size || 0,
             mtime: cached.mtime || 0,
             added: cached.added || 0,
-            title: cached.title || "",
-            artist: cached.artist || "",
-            composer: cached.composer || "",
-            genre: cached.genre || "",
-            album: cached.album || "",
+            title: screenSafe(cached.title || ""),
+            artist: screenSafe(cached.artist || ""),
+            composer: screenSafe(cached.composer || ""),
+            genre: screenSafe(cached.genre || ""),
+            album: screenSafe(cached.album || ""),
             year: cached.year || "",
             durationMs: cached.durationMs || "",
             trackNumber: cached.trackNumber || ""
@@ -727,11 +727,11 @@ interface AppState {
             size: size,
             mtime: mtime,
             added: typeof meta.added === "number" ? meta.added : 0,
-            title: trimValue(parsed.title),
-            artist: trimValue(parsed.artist),
-            composer: trimValue(parsed.composer),
-            genre: trimValue(parsed.genre),
-            album: trimValue(parsed.album),
+            title: screenSafe(parsed.title),
+            artist: screenSafe(parsed.artist),
+            composer: screenSafe(parsed.composer),
+            genre: screenSafe(parsed.genre),
+            album: screenSafe(parsed.album),
             year: trimValue(parsed.year),
             durationMs: trimValue(parsed.durationMs),
             trackNumber: trimValue(parsed.trackNumber)
@@ -867,16 +867,67 @@ interface AppState {
         return tracks;
     }
 
-    function toScreenText(value: any): string {
-        var text = safeString(value);
-        if (!text.length) return "";
-        if (typeof str_is_utf8 === "function" && typeof utf8_cp437 === "function" && console.term_supports && !console.term_supports(USER_UTF8)) {
+    // --- decorative-Unicode transliteration ---------------------------------
+    // AI-generated artist handles use small-caps, fullwidth, accented, and
+    // emoji glyphs (e.g. "🗲ᴍʀᴏ1337" — a decorated
+    // "mro1337"). Their codepoints are >0xFF; rendered on a CP437 terminal each
+    // is truncated to 8 bits and some land on C0 controls (U+1D0D -> 0x0D CR)
+    // that jump the cursor, smear the list, and corrupt the JSON cache. Fold
+    // everything to plain ASCII so metadata is safe on every terminal.
+    var SMALL_CAPS: { [cp: number]: string } = {
+        0x1D00: "a", 0x0299: "b", 0x1D04: "c", 0x1D05: "d", 0x1D07: "e", 0xA730: "f",
+        0x0262: "g", 0x029C: "h", 0x026A: "i", 0x1D0A: "j", 0x1D0B: "k", 0x029F: "l",
+        0x1D0D: "m", 0x0274: "n", 0x1D0F: "o", 0x1D18: "p", 0xA7AF: "q", 0x0280: "r",
+        0xA731: "s", 0x1D1B: "t", 0x1D1C: "u", 0x1D20: "v", 0x1D21: "w", 0x028F: "y",
+        0x1D22: "z", 0x1D01: "ae"
+    };
+    var GLYPH_ASCII: { [cp: number]: string } = {
+        0x2018: "'", 0x2019: "'", 0x201A: "'", 0x2032: "'",
+        0x201C: "\"", 0x201D: "\"", 0x201E: "\"", 0x2033: "\"",
+        0x2013: "-", 0x2014: "-", 0x2015: "-", 0x2212: "-",
+        0x2026: "...", 0x2022: "*", 0x00B7: "*", 0x00D7: "x", 0x00F7: "/",
+        0x2260: "!=", 0x2264: "<=", 0x2265: ">=", 0x00B1: "+/-",
+        0x00A9: "(c)", 0x00AE: "(r)", 0x2122: "tm", 0x00B0: "deg",
+        0x00C6: "AE", 0x00E6: "ae", 0x0152: "OE", 0x0153: "oe", 0x00DF: "ss",
+        0x20AC: "EUR", 0x00A3: "GBP", 0x00A5: "JPY", 0x00A2: "c"
+    };
+    // Latin-1 accented letters 0xC0..0xFF -> base ASCII. A space means "handled
+    // above / drop" (index by codepoint - 0xC0).
+    var LATIN1_FOLD = "AAAAAAACEEEEIIIIDNOOOOO OUUUUYT aaaaaaaceeeeiiiidnooooo ouuuuyty";
+
+    // Collapse decorative text to terminal-safe ASCII. Idempotent on clean text.
+    function screenSafe(value: any): string {
+        var s = safeString(value);
+        if (!s.length) return "";
+        // Raw UTF-8 bytes (e.g. straight from an .ini) -> codepoints first, so
+        // multibyte glyphs fold as a unit instead of being mangled byte-by-byte.
+        if (typeof str_is_utf8 === "function" && typeof utf8_utf16 === "function") {
             try {
-                if (str_is_utf8(text)) return utf8_cp437(text);
+                if (str_is_utf8(s) && /[\x80-\xff]/.test(s)) s = utf8_utf16(s);
             } catch (_) {
             }
         }
-        return text;
+        var out = "";
+        for (var i = 0; i < s.length; i += 1) {
+            var c = s.charCodeAt(i);
+            if (c === 0x09) { out += " "; continue; }          // tab -> space
+            if (c < 0x20 || c === 0x7f) continue;              // strip C0 controls + DEL
+            if (c <= 0x7e) { out += s.charAt(i); continue; }   // printable ASCII
+            if (SMALL_CAPS[c] !== undefined) { out += SMALL_CAPS[c]; continue; }
+            if (GLYPH_ASCII[c] !== undefined) { out += GLYPH_ASCII[c]; continue; }
+            if (c >= 0xc0 && c <= 0xff) {
+                var f = LATIN1_FOLD.charAt(c - 0xc0);
+                if (f !== " ") out += f;
+                continue;
+            }
+            if (c >= 0xff01 && c <= 0xff5e) { out += String.fromCharCode(c - 0xfee0); continue; }
+            // Unknown decorative / emoji / symbol: drop it.
+        }
+        return out.replace(/[ \t]{2,}/g, " ").replace(/^\s+|\s+$/g, "");
+    }
+
+    function toScreenText(value: any): string {
+        return screenSafe(value);
     }
 
     function getFilteredTracks(app: AppState): TrackSummary[] {
@@ -2099,8 +2150,40 @@ interface AppState {
         }
     }
 
+    // Regression guard for the CP437 artist-name corruption: the real tag
+    // "Vektrax feat. 🗲ᴍʀᴏ1337" decoded to small-caps + astral codepoints, and
+    // naive rendering turned U+1D0D into 0x0D (CR) that smeared the track list.
+    function sanitizerSelfTest(): void {
+        function must(got: string, want: string, label: string): void {
+            if (got !== want)
+                throw new Error("sanitizer " + label + ": got " + JSON.stringify(got) +
+                    " want " + JSON.stringify(want));
+            for (var i = 0; i < got.length; i += 1) {
+                var c = got.charCodeAt(i);
+                if (c < 0x20 || c > 0x7e)
+                    throw new Error("sanitizer " + label + ": unsafe byte 0x" + c.toString(16));
+            }
+        }
+        // small-caps "mro" + astral lightning + embedded controls
+        var smallcaps = String.fromCharCode(0x1D0D, 0x0280, 0x1D0F);
+        must(screenSafe("Vektrax feat. " + String.fromCharCode(0xD83D, 0xDDF2) +
+            smallcaps + "1337" + String.fromCharCode(0xD83D, 0xDDF2)),
+            "Vektrax feat. mro1337", "decorated-handle-surrogate");
+        // the form the door actually sees: utf8_utf16() truncates the astral
+        // U+1F5F2 to a single BMP code 0xF5F2 before screenSafe runs.
+        must(screenSafe("Vektrax feat. " + String.fromCharCode(0xF5F2) +
+            smallcaps + "1337" + String.fromCharCode(0xF5F2)),
+            "Vektrax feat. mro1337", "decorated-handle-decoded");
+        must(screenSafe("A" + String.fromCharCode(0x0D, 0x0F, 0x1B) + "B"), "AB", "controls");
+        must(screenSafe("darksix"), "darksix", "clean-passthrough");
+        must(screenSafe(String.fromCharCode(0x201C) + "hi" + String.fromCharCode(0x201D)),
+            "\"hi\"", "smart-quotes");
+        writeln("sanitizer self-test: OK");
+    }
+
     function main(): void {
         if (typeof argv !== "undefined" && argv && argv.indexOf("--selftest") >= 0) {
+            sanitizerSelfTest();
             FLPlayer.selfTest();
             return;
         }
