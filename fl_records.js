@@ -1734,16 +1734,66 @@ var FLPlayer;
         console.write(gotoRC(l.boxTop + 2, l.boxLeft + 2) +
             bar + " " + sgr("0;37") + timeTxt + sgr(paused ? "1;33" : "0;36") + volTxt + CLR);
     }
-    function drawHints(l) {
-        // ASCII only: CP437 arrow glyphs live at C0 control positions (0x1B is
-        // ESC!) and cannot be sent raw without corrupting the terminal state.
-        var hints = "[Space]Pause   [N/P]Track   [B]rowse   [C]reate   [Q]uit";
-        if (hints.length > l.boxWidth)
-            hints = "[Spc]Pse [N/P]Trk [B]rowse [C]reate [Q]uit";
-        if (hints.length > l.boxWidth)
-            hints = "[Spc][N/P][B][C][Q]";
-        var col = Math.max(1, l.boxLeft + Math.floor((l.boxWidth - hints.length) / 2));
-        console.write(gotoRC(Math.min(l.rows, l.boxTop + 4), col) + sgr("0;30;1") + hints + CLR);
+    // Hint bar with three luminance tiers -- dim separators ("[" "]" "/"),
+    // medium labels, bright hotkeys -- and a hue that cycles on the beat.
+    // ASCII only (CP437 arrow glyphs sit at C0 control positions).
+    var HINTS = [
+        { keys: ["Space"], label: "Pause" },
+        { keys: ["N", "P"], label: "Track" },
+        { keys: ["B"], label: "rowse" },
+        { keys: ["C"], label: "reate" },
+        { keys: ["Q"], label: "uit" }
+    ];
+    // [dim, medium, bright] SGR per triad: dim = plain hue, medium = bold hue,
+    // bright = bold white/accent, so the tier hierarchy always reads.
+    var HINT_TRIADS = [
+        ["0;36", "0;1;36", "1;37"], // cyan
+        ["0;35", "0;1;35", "1;37"], // magenta
+        ["0;32", "0;1;32", "1;37"], // green
+        ["0;33", "0;1;33", "1;37"], // amber
+        ["0;34", "0;1;34", "1;36"], // blue / cyan hotkeys
+        ["0;31", "0;1;31", "1;33"] // red / yellow hotkeys
+    ];
+    function buildHints(withLabels, tri) {
+        var dim = sgr(tri[0]);
+        var med = sgr(tri[1]);
+        var brt = sgr(tri[2]);
+        var out = "";
+        var len = 0;
+        var gap = withLabels ? "   " : " ";
+        for (var i = 0; i < HINTS.length; i++) {
+            if (i > 0) {
+                out += gap;
+                len += gap.length;
+            }
+            var h = HINTS[i];
+            out += dim + "[";
+            len += 1;
+            for (var k = 0; k < h.keys.length; k++) {
+                if (k > 0) {
+                    out += dim + "/";
+                    len += 1;
+                }
+                out += brt + h.keys[k];
+                len += h.keys[k].length;
+            }
+            out += dim + "]";
+            len += 1;
+            if (withLabels) {
+                out += med + h.label;
+                len += h.label.length;
+            }
+        }
+        return { text: out, len: len };
+    }
+    function drawHints(l, triadIdx) {
+        var n = HINT_TRIADS.length;
+        var tri = HINT_TRIADS[((triadIdx % n) + n) % n];
+        var h = buildHints(true, tri);
+        if (h.len > l.boxWidth)
+            h = buildHints(false, tri);
+        var col = Math.max(1, l.boxLeft + Math.floor((l.boxWidth - h.len) / 2));
+        console.write(gotoRC(Math.min(l.rows, l.boxTop + 4), col) + h.text + CLR);
     }
     // Audio-reactive glow strips flanking the lyric line: reach follows
     // loudness, color follows brightness (ZCR): bass reads red/magenta,
@@ -2202,6 +2252,8 @@ var FLPlayer;
         var visMode = 0;
         var bgMode = 0; // BG_MODES index
         var borderPulse = 0; // decaying beat flash
+        var hintTriad = 0; // HINT_TRIADS index; cycles on beats
+        var hintFlashAt = 0; // rate-cap for the hint hue cycle
         var lastRms = 0;
         var artFlashAt = 0;
         var PALETTE_SEQ = []; // chosen once the art grid exists
@@ -2270,7 +2322,7 @@ var FLPlayer;
             drawBackdrop(track, l, blit);
             drawBoxFrame(l, "0;34");
             drawTitleLine(l, track);
-            drawHints(l);
+            drawHints(l, hintTriad);
             checkerDirty = true;
             strobeLevel = 0;
             for (var si = 0; si < sprites.length; si++) {
@@ -2531,6 +2583,14 @@ var FLPlayer;
                     drawArt(blit);
                     drawSprites(sprites, l, blit, true);
                 }
+                // Hint-bar hue cycles on the beat (rate-capped so it pulses with
+                // the music instead of strobing). Redraw now so the color change
+                // shows even on frames the background didn't repaint.
+                if (beat && now - hintFlashAt > 220) {
+                    hintFlashAt = now;
+                    hintTriad = (hintTriad + 1) % HINT_TRIADS.length;
+                    drawHints(l, hintTriad);
+                }
                 // Background margins, all music-locked: checker phase steps
                 // on beats; plasma time flows with loudness and jolts on
                 // beats; ripples SPAWN on beats and expand with loudness;
@@ -2632,7 +2692,7 @@ var FLPlayer;
                     }
                 }
                 if (bgPainted)
-                    drawHints(l);
+                    drawHints(l, hintTriad);
                 drawProgress(l, clamp(playMs / 1000, 0, totalSec), totalSec, paused);
                 var diag = l.cols + "x" + l.rows + " c" + cprSeen + " r" + relayouts;
                 console.write(gotoRC(l.rows, Math.max(1, l.cols - diag.length)) +
