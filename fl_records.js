@@ -2903,7 +2903,9 @@ var FLPlayer;
         var hintTriad = 0; // HINT_TRIADS index; cycles on beats
         var hintFlashAt = 0; // rate-cap for the hint hue cycle
         var lastRms = 0;
-        var artFlashAt = 0;
+        var artFlashAt = nowMs();
+        var ART_STATIC_MS = 6000; // force an art transition at least this often,
+        // even with no beats -- keeps soft/ambient passages from freezing the art.
         var PALETTE_SEQ = []; // chosen once the art grid exists
         var palStep = 0;
         // Art-swap styles (rotate with the effect): pulse = step the palette on
@@ -3332,9 +3334,12 @@ var FLPlayer;
                             drawSprites(sprites, l, blit, true);
                         }
                     }
-                    else if (beat && now - artFlashAt > 460) {
-                        // New transition on the beat: mostly a wipe (random
-                        // direction), sometimes an instant swap or a flash burst.
+                    else if ((beat && now - artFlashAt > 460) || now - artFlashAt > ART_STATIC_MS) {
+                        // New transition on the beat -- OR on a time fallback, so
+                        // the art never freezes through a soft, beatless passage.
+                        // Mostly a wipe (random direction), sometimes an instant
+                        // swap or a flash burst. A fallback (no beat) uses only the
+                        // calm styles -- never the energetic flash burst in a lull.
                         artFlashAt = now;
                         palStep = PALETTE_SEQ.length ? (palStep + 1) % PALETTE_SEQ.length : 0;
                         var target = PALETTE_SEQ.length ? PALETTE_SEQ[palStep] : 0;
@@ -3344,7 +3349,7 @@ var FLPlayer;
                             drawArt(blit);
                             drawSprites(sprites, l, blit, true);
                         }
-                        else if (roll < 0.30) { // flash burst
+                        else if (beat && roll < 0.30) { // flash burst (real beats only)
                             blit.pal = target;
                             artRotFrames = 4;
                         }
