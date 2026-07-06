@@ -2160,7 +2160,7 @@ var FLPlayer;
     // shade/color follow loudness/brightness, with a bright strobe flash
     // decaying over a few frames on hard beats. The lyric line, glow strips,
     // box and hints rows are never touched. [B] cycles auto/checker/strobe/off.
-    var BG_MODES = ["auto", "checker", "plasma", "ripple", "tunnel", "starfield", "matrix", "fire", "strobe", "off"];
+    var BG_MODES = ["auto", "checker", "plasma", "ripple", "tunnel", "starfield", "matrix", "fire", "equalizer", "spiral", "aurora", "strobe", "off"];
     function marginRects(l, blit) {
         var rects = [];
         var zoneTop = l.artTop;
@@ -2457,6 +2457,61 @@ var FLPlayer;
                 return null;
             var b = Math.min(FIRE_CHARS.length - 1, Math.floor(hv * FIRE_CHARS.length));
             return b > 0 ? [FIRE_COLORS[b], FIRE_CHARS[b]] : null;
+        });
+    }
+    /** Spiral: rotating arms winding into the centre (hypnotic). */
+    function drawSpiral(rects, t, zcr, cx, cy) {
+        fieldPaint(rects, zcr, function (x, y) {
+            var dx = (x - cx) * 0.5, dy = y - cy;
+            var dist = Math.sqrt(dx * dx + dy * dy);
+            var ang = Math.atan2(dy, dx);
+            return Math.sin(ang * 3 + dist * 0.4 - t) * 0.5 + 0.5;
+        });
+    }
+    /** Aurora: soft horizontal curtains undulating side to side. */
+    function drawAurora(rects, t, zcr) {
+        fieldPaint(rects, zcr, function (x, y) {
+            return Math.sin(y * 0.5 + Math.sin(x * 0.08 + t) * 2 + t * 0.5) * 0.5 + 0.5;
+        });
+    }
+    // Graphic equaliser: a bar per column, height driven by loudness with a
+    // per-band oscillation (edges lean on ZCR = "highs", middle on RMS = "lows"),
+    // fast attack / slow decay, and falling peak caps. Bars rise in the art-zone
+    // margins (they frame the art on wide terminals). VU colour ramp.
+    function stepEq(bars, peaks, cols, rms, zcr, beat, t) {
+        while (bars.length <= cols) {
+            bars.push(0);
+            peaks.push(0);
+        }
+        for (var x = 1; x <= cols; x++) {
+            var band = Math.abs(x - cols / 2) / Math.max(1, cols / 2); // 0 centre .. 1 edge
+            var osc = 0.55 + 0.45 * Math.sin(x * 0.7 + t * (2 + band * 3));
+            var target = clamp((rms * (1 - band * 0.45) * 0.75 + zcr * band * 0.7) * osc +
+                (beat ? 0.22 : 0), 0, 1);
+            if (target > bars[x])
+                bars[x] += (target - bars[x]) * 0.55; // fast attack
+            else
+                bars[x] += (target - bars[x]) * 0.18; // slow decay
+            if (bars[x] > peaks[x])
+                peaks[x] = bars[x];
+            else
+                peaks[x] = Math.max(bars[x], peaks[x] - 0.025);
+        }
+    }
+    function drawEq(rects, bars, peaks, top, base) {
+        var span = Math.max(1, base - top);
+        cellPaint(rects, function (x, y) {
+            var h = bars[x] || 0;
+            var pk = peaks[x] || 0;
+            var py = base - Math.round(pk * span);
+            var barTop = base - Math.round(h * span);
+            if (pk > 0.05 && y === py && y <= barTop)
+                return ["1;37", "\xDF"]; // peak cap
+            if (h >= 0.02 && y >= barTop && y <= base) {
+                var frac = (base - y) / span;
+                return [frac > 0.72 ? "1;31" : frac > 0.45 ? "1;33" : "0;32", "\xDB"];
+            }
+            return null;
         });
     }
     var TRAIL_COLORS = ["0;35", "0;34", "0;36", "0;31", "0;32", "1;30"];
@@ -2789,11 +2844,15 @@ var FLPlayer;
         var lastFeatChunk = -1;
         var autoIdx = 0; // auto rotation through the field/ascii effects
         var spriteMode = 0; // avatar motion mode, rotates with the effect
-        var AUTO_EFFECTS = ["checker", "plasma", "ripple", "tunnel", "starfield", "matrix", "fire"];
+        var AUTO_EFFECTS = ["checker", "plasma", "ripple", "tunnel", "starfield", "matrix", "fire", "equalizer", "spiral", "aurora"];
         var tunnelT = 0; // tunnel scroll phase
+        var waveT = 0; // spiral / aurora phase
         var stars = []; // starfield warp points
         var matrixDrops = []; // matrix rain columns
         var fireHeat = {}; // fire heat field
+        var eqBars = []; // equaliser bar heights (per column)
+        var eqPeaks = []; // equaliser peak-hold caps
+        var eqT = 0; // equaliser oscillation phase
         var lastAutoSwitchAt = nowMs();
         var blit = makeArtBlit(track, l);
         var sprites = makeSprites(track, l);
@@ -2869,6 +2928,8 @@ var FLPlayer;
             stars = [];
             matrixDrops = [];
             fireHeat = {}; // positions were screen-relative
+            eqBars = [];
+            eqPeaks = [];
             wipeActive = false;
             redrawAll();
         }
@@ -3266,6 +3327,28 @@ var FLPlayer;
                     else if (bg === "fire") {
                         drawFire(margins, fireHeat, l.cols, l.rows, l.artTop, features.rms, beat);
                         bgPainted = true;
+                    }
+                    else if (bg === "equalizer") {
+                        eqT += 0.35 + features.rms * 0.6;
+                        stepEq(eqBars, eqPeaks, l.cols, features.rms, features.zcr, beat, eqT);
+                        drawEq(margins, eqBars, eqPeaks, l.artTop, l.artBottom);
+                        bgPainted = true;
+                    }
+                    else if (bg === "spiral") {
+                        waveT += 0.12 + features.rms * 0.45;
+                        if (beat)
+                            waveT += 0.6;
+                        if (fieldTick % 2 === 0 || beat) {
+                            drawSpiral(margins, waveT, features.zcr, fxCx, fxCy);
+                            bgPainted = true;
+                        }
+                    }
+                    else if (bg === "aurora") {
+                        waveT += 0.1 + features.rms * 0.4;
+                        if (fieldTick % 2 === 0 || beat) {
+                            drawAurora(margins, waveT, features.zcr);
+                            bgPainted = true;
+                        }
                     }
                 }
                 if (mode !== "off" && borderPulse > 0) {
