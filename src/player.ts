@@ -1295,7 +1295,7 @@ namespace FLPlayer {
         return w.length > 12 ? w.substr(0, 12) : w;
     }
     function stepLyricRain(drops: LyricDrop[], cols: number, rows: number, top: number,
-        rms: number, beat: boolean, src: string): void {
+        rms: number, hi: number, beat: boolean, src: string): void {
         if (src && drops.length < cols + 6 && (Math.random() < 0.22 + rms * 0.5 || beat)) {
             var w = rainWord(src);
             if (w)
@@ -1304,10 +1304,14 @@ namespace FLPlayer {
                     speed: 0.3 + Math.random() * 0.5, glitch: 0
                 });
         }
+        // Binary flashing tracks the music two ways: beats spike it, and bright
+        // (trebly / electronic) passages hold a floor so the words keep
+        // digitizing -- mellow acoustic parts decay back to readable letters.
+        var floor = hi * 0.45;
         for (var i = drops.length - 1; i >= 0; i--) {
             var d = drops[i];
             d.head += d.speed * (0.5 + rms * 0.9);       // slow enough that words stay readable
-            d.glitch = beat ? Math.min(1, d.glitch + 0.6) : d.glitch * 0.82;   // beats digitize
+            d.glitch = beat ? Math.min(1, d.glitch + 0.6) : Math.max(floor, d.glitch * 0.82);
             if (d.head - d.text.length > rows) drops.splice(i, 1);
         }
     }
@@ -2230,7 +2234,7 @@ namespace FLPlayer {
                         // feed the current line (persist the last one through gaps)
                         if (lyricIdx >= 0 && lyrics[lyricIdx] && lyrics[lyricIdx].text)
                             rainSrc = lyrics[lyricIdx].text;
-                        stepLyricRain(lyricDrops, l.cols, l.rows, l.artTop, features.rms, beat, rainSrc);
+                        stepLyricRain(lyricDrops, l.cols, l.rows, l.artTop, features.rms, features.hi, beat, rainSrc);
                         drawLyricRain(margins, lyricDrops);
                         bgPainted = true;
                     } else if (bg === "fire") {
