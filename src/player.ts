@@ -574,10 +574,10 @@ namespace FLPlayer {
     }
 
     // ---- per-chunk audio features -----------------------------------------
-    export function chunkFeatures(slice: string, channels: number): { rms: number; raw: number; zcr: number } {
+    export function chunkFeatures(slice: string, channels: number): { rms: number; raw: number; zcr: number; lo: number; mid: number; hi: number } {
         var frames = Math.floor(slice.length / (channels * 2));
         if (frames < 2)
-            return { rms: 0, raw: 0, zcr: 0 };
+            return { rms: 0, raw: 0, zcr: 0, lo: 0, mid: 0, hi: 0 };
         // RMS (loudness): strided samples across the whole chunk.
         var points = 256;
         var step = Math.max(1, Math.floor(frames / points));
@@ -591,7 +591,7 @@ namespace FLPlayer {
             count++;
         }
         if (!count)
-            return { rms: 0, raw: 0, zcr: 0 };
+            return { rms: 0, raw: 0, zcr: 0, lo: 0, mid: 0, hi: 0 };
         var raw = Math.sqrt(sumSq / count) / 32768;
         // Perceptual-ish lift for METERS only: quiet music still moves them.
         // Beat/onset detection uses `raw` — the lift compresses loud passages
@@ -603,6 +603,11 @@ namespace FLPlayer {
         var start = Math.floor((frames - winFrames) / 2);
         var crossings = 0;
         var prev = 0;
+        // Genuine 3-band energy from the SAME contiguous window: two one-pole
+        // low-passes split the waveform into lows (<~300Hz) / mids / highs
+        // (>~1.3kHz), so the equaliser reacts to real frequency content, not a
+        // faked per-bar wobble. lp1/lp2 are the running low-passed signals.
+        var lp1 = 0, lp2 = 0, eLo = 0, eMid = 0, eHi = 0;
         for (var w = 0; w < winFrames; w++) {
             var s = rd16(slice, (start + w) * channels * 2);
             if (s >= 0x8000)
@@ -610,10 +615,20 @@ namespace FLPlayer {
             if (w > 0 && ((s >= 0) !== (prev >= 0)))
                 crossings++;
             prev = s;
+            var sn = s / 32768;
+            lp1 += (sn - lp1) * 0.08;              // heavy low-pass  -> bass
+            lp2 += (sn - lp2) * 0.34;              // lighter low-pass -> bass+mid
+            var bLo = lp1, bMid = lp2 - lp1, bHi = sn - lp2;
+            eLo += bLo * bLo; eMid += bMid * bMid; eHi += bHi * bHi;
         }
         // crossings/frame *at the PCM rate*: ~0.02 = bassy, ~0.25+ = bright.
         var zcr = clamp((crossings / winFrames) * 5, 0, 1);
-        return { rms: rms, raw: raw, zcr: zcr };
+        // Band RMS with a per-band perceptual lift (upper bands carry less
+        // energy, so they get a bigger multiplier to stay visible on the meter).
+        var lo = clamp(Math.sqrt(eLo / winFrames) * 3.6, 0, 1);
+        var mid = clamp(Math.sqrt(eMid / winFrames) * 6.5, 0, 1);
+        var hi = clamp(Math.sqrt(eHi / winFrames) * 9.0, 0, 1);
+        return { rms: rms, raw: raw, zcr: zcr, lo: lo, mid: mid, hi: hi };
     }
 
     // ---- synced lyrics -------------------------------------------------------
@@ -1350,42 +1365,51 @@ namespace FLPlayer {
         });
     }
 
-    // Cyberpunk graphic equaliser: SEGMENTED neon bars -- 2 columns wide with a
-    // 1-column gap (EQ_PERIOD 3) so they read as distinct bars, not a green
-    // blob. One height per band (low bands lean on RMS = "lows", high bands on
-    // ZCR = "highs") with per-band oscillation, snappy attack / slow decay,
-    // floating peak caps. Neon ramp cyan -> purple -> magenta -> hot red.
-    var EQ_PERIOD = 3;
-    function stepEq(bars: number[], peaks: number[], cols: number, rms: number,
-        zcr: number, beat: boolean, t: number): void {
+    // Cyberpunk graphic equaliser. Bars are driven by REAL frequency bands
+    // (chunkFeatures lo/mid/hi from the one-pole split), interpolated across the
+    // bar row: left = lows, right = highs. Thin 1-col bars with a 1-col gap
+    // (EQ_PERIOD 2) read as a segmented spectrum, and the top cell uses a CP437
+    // half-block so heights land on half-cell steps instead of snapping to whole
+    // rows -- crisper, more analog. Gentle oscillation adds life without driving
+    // the height (the old faked wobble maxed every bar on the beat). Neon ramp
+    // cyan -> purple -> magenta -> hot red, white floating peak caps.
+    var EQ_PERIOD = 2;
+    function eqColor(frac: number): string {
+        return frac > 0.78 ? "1;31" : frac > 0.52 ? "1;35" : frac > 0.26 ? "0;35" : "1;36";
+    }
+    function stepEq(bars: number[], peaks: number[], cols: number, lo: number,
+        mid: number, hi: number, beat: boolean, t: number): void {
         var n = Math.floor(cols / EQ_PERIOD) + 2;
         while (bars.length < n) { bars.push(0); peaks.push(0); }
         for (var i = 0; i < n; i++) {
-            var f = n > 1 ? i / (n - 1) : 0;                       // 0..1 pseudo low->high
-            var osc = 0.45 + 0.55 * Math.sin(i * 0.9 + t * (1.6 + f * 3));
-            var target = clamp((rms * (1.15 - f * 0.7) + zcr * (0.25 + f)) * osc * 1.15 +
-                (beat ? 0.28 : 0), 0, 1);
-            if (target > bars[i]) bars[i] += (target - bars[i]) * 0.6;    // snappy attack
-            else bars[i] += (target - bars[i]) * 0.16;                    // slow decay
+            var f = n > 1 ? i / (n - 1) : 0;                       // 0 lows .. 1 highs
+            // sample the real 3-band spectrum at this bar position
+            var band = f < 0.5 ? lo + (mid - lo) * (f * 2)
+                : mid + (hi - mid) * ((f - 0.5) * 2);
+            var osc = 0.84 + 0.16 * Math.sin(i * 0.7 + t * (1.2 + f * 2));   // subtle shimmer
+            var target = clamp(band * osc * 1.3 + (beat ? 0.09 : 0), 0, 1);
+            if (target > bars[i]) bars[i] += (target - bars[i]) * 0.66;   // snappy attack
+            else bars[i] += (target - bars[i]) * 0.13;                    // slow decay
             if (bars[i] > peaks[i]) peaks[i] = bars[i];
-            else peaks[i] = Math.max(bars[i], peaks[i] - 0.028);
+            else peaks[i] = Math.max(bars[i], peaks[i] - 0.03);
         }
     }
     function drawEq(rects: Rect[], bars: number[], peaks: number[], top: number, base: number): void {
         var span = Math.max(1, base - top);
         cellPaint(rects, function (x: number, y: number): string[] | null {
-            if ((x - 1) % EQ_PERIOD === EQ_PERIOD - 1) return null;         // gap column
-            var i = Math.floor((x - 1) / EQ_PERIOD);
+            if ((x - 1) % EQ_PERIOD !== 0) return null;                    // gap column
+            var i = (x - 1) / EQ_PERIOD;
             var h = bars[i] || 0;
             var pk = peaks[i] || 0;
-            var py = base - Math.round(pk * span);
-            var barTop = base - Math.round(h * span);
-            if (pk > 0.05 && y === py && y <= barTop) return ["1;37", "\xDF"];   // white peak cap
-            if (h >= 0.02 && y >= barTop && y <= base) {
-                var frac = (base - y) / span;                              // 0 bottom .. 1 top
-                var col = frac > 0.78 ? "1;31" : frac > 0.52 ? "1;35" : frac > 0.26 ? "0;35" : "1;36";
-                return [col, "\xDB"];
-            }
+            var hc = h * span;                          // fractional height in cells
+            var full = Math.floor(hc);
+            var frac = hc - full;
+            var fullTopY = base - full + 1;             // topmost full-block row
+            var halfY = base - full;                    // half-block row (above full)
+            var py = base - Math.round(pk * span);      // floating peak-cap row
+            if (pk > 0.06 && y === py && y < halfY) return ["1;37", "\xDF"];       // peak cap
+            if (h >= 0.02 && y >= fullTopY && y <= base) return [eqColor((base - y) / span), "\xDB"];
+            if (frac >= 0.35 && y === halfY && halfY >= top) return [eqColor((base - halfY) / span), "\xDC"];
             return null;
         });
     }
@@ -1820,8 +1844,9 @@ namespace FLPlayer {
         var lastFlushAt = nowMs();
         var lastUiAt = 0;
         var result: PlayResult = "ended";
-        var features: { rms: number; raw: number; zcr: number } = { rms: 0, raw: 0, zcr: 0 };
-        var featForChunk: { rms: number; raw: number; zcr: number }[] = [];
+        var features: { rms: number; raw: number; zcr: number; lo: number; mid: number; hi: number } =
+            { rms: 0, raw: 0, zcr: 0, lo: 0, mid: 0, hi: 0 };
+        var featForChunk: { rms: number; raw: number; zcr: number; lo: number; mid: number; hi: number }[] = [];
 
         function emitChunk(idx: number): void {
             f.position = info.dataOffset + idx * chunkBytes;
@@ -2177,7 +2202,7 @@ namespace FLPlayer {
                         bgPainted = true;
                     } else if (bg === "equalizer") {
                         eqT += 0.35 + features.rms * 0.6;
-                        stepEq(eqBars, eqPeaks, l.cols, features.rms, features.zcr, beat, eqT);
+                        stepEq(eqBars, eqPeaks, l.cols, features.lo, features.mid, features.hi, beat, eqT);
                         drawEq(margins, eqBars, eqPeaks, l.artTop, l.artBottom);
                         bgPainted = true;
                     } else if (bg === "spiral") {
