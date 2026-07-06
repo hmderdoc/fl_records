@@ -1392,6 +1392,7 @@ interface AppState {
             var history: number[] = [];   // played indices, oldest-first: P returns to the REAL previous track
             var bag: number[] = [];       // shuffle deck: every queue track plays once before any repeats
             seedBag(bag, curList.length, idx);   // first cycle excludes the track already playing
+            var shufCount = 1;            // 1-based position within the CURRENT shuffle cycle (1..len, then resets)
             while (bbs.online && !js.terminated) {
                 var cur = curList[idx];
                 // Immediate feedback for the inter-track gap (tag parse +
@@ -1431,8 +1432,10 @@ interface AppState {
                     lyrics: timed,
                     flatLyrics: flat,
                     avatars: trackAvatars(cur),
-                    queueName: currentPlaylist,     // "" for radio/browse -> no tag shown
-                    queuePos: idx + 1,
+                    queueName: currentPlaylist,     // "" for radio/browse -> no count shown
+                    // Shuffle: position within the cycle (1..len, resets each cycle).
+                    // Sequential: natural track number in the list.
+                    queuePos: FLPlayer.shuffle ? shufCount : (idx + 1),
                     queueLen: curList.length
                 };
                 var outcome = FLPlayer.playTrack(playable);
@@ -1466,7 +1469,7 @@ interface AppState {
                         idx = Math.max(0, Math.min(pick.index, curList.length - 1));
                         currentPlaylist = pick.playlist || "";
                         if (pick.playlist) FLPlayer.shuffle = false;  // play a playlist in its arranged order
-                        history = []; seedBag(bag, curList.length, idx);   // fresh queue -> fresh history/shuffle cycle
+                        history = []; seedBag(bag, curList.length, idx); shufCount = 1;   // fresh queue -> fresh cycle
                     }
                     console.clear();
                     continue;
@@ -1482,7 +1485,7 @@ interface AppState {
                         curList.splice(idx, 1);          // drop from the live queue too
                         if (!curList.length) return;     // playlist emptied -> leave
                         if (idx >= curList.length) idx = 0;
-                        history = []; seedBag(bag, curList.length, idx);   // indices shifted -> reset nav state
+                        history = []; seedBag(bag, curList.length, idx); shufCount = 1;   // indices shifted -> reset nav state
                     } else {
                         console.clear();
                         console.writeln("");
@@ -1520,14 +1523,22 @@ interface AppState {
                     var steps = Math.abs(moves);
                     for (var mv = 0; mv < steps; mv += 1) {
                         if (goBack) {
-                            if (history.length) idx = history.pop() as number;
-                            else if (!FLPlayer.shuffle) idx = (idx - 1 + curList.length) % curList.length;
+                            if (history.length) {
+                                idx = history.pop() as number;
+                                if (FLPlayer.shuffle && shufCount > 1) shufCount -= 1;   // step back in the cycle
+                            } else if (!FLPlayer.shuffle) {
+                                idx = (idx - 1 + curList.length) % curList.length;
+                            }
                             // shuffle with no history yet: stay on the current track
                         } else {
                             history.push(idx);
                             if (history.length > 500) history.shift();
                             if (FLPlayer.shuffle && curList.length > 1) {
+                                // An empty bag means shuffleNext starts a NEW cycle:
+                                // the counter resets to 1; otherwise it advances.
+                                var newCycle = bag.length === 0;
                                 idx = shuffleNext(curList.length, idx, bag);
+                                shufCount = newCycle ? 1 : shufCount + 1;
                             } else {
                                 idx = (idx + 1) % curList.length;
                             }
@@ -2814,6 +2825,18 @@ interface AppState {
             }
             if (!seen[nxt]) { seen[nxt] = true; seenCount += 1; }
             cur = nxt;
+        }
+        // Cycle counter (the "3/42" indicator): NEXT must read 1,2,..,len,1,2,..
+        // -- position within the cycle, resetting when the bag reshuffles.
+        var cbag: number[] = []; var cidx = 0; var cCount = 1;
+        seedBag(cbag, len, cidx);
+        var want = 1;
+        for (var c = 0; c < len * 3; c += 1) {
+            if (cCount !== want) throw new Error("cycle count " + cCount + " != " + want);
+            var wasEmpty = cbag.length === 0;
+            cidx = shuffleNext(len, cidx, cbag);
+            cCount = wasEmpty ? 1 : cCount + 1;
+            want = want >= len ? 1 : want + 1;
         }
         writeln("shuffle self-test: OK");
     }

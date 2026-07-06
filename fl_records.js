@@ -2050,42 +2050,33 @@ var FLPlayer;
     }
     function drawTitleLine(l, track) {
         var inner = l.boxWidth - 4;
-        // Right-aligned playlist tag ("MyList 3/12") -- shown ONLY when the queue
-        // is a playlist, so its presence tells you a playlist is loaded (vs radio).
-        var tag = "";
-        if (track.queueName && track.queueLen && track.queueLen > 0) {
-            var nm = track.queueName.length > 16 ? track.queueName.substr(0, 15) + "\xAF" : track.queueName;
-            tag = nm + " " + track.queuePos + "/" + track.queueLen;
-        }
-        var titleRoom = inner;
-        if (tag.length && inner - tag.length - 1 >= 12)
-            titleRoom = inner - tag.length - 1;
-        else
-            tag = ""; // too narrow -> drop the tag, keep the title
         var label = "\x0e " + track.title + (track.artist.length ? " - " + track.artist : "");
-        if (label.length > titleRoom)
-            label = label.substr(0, titleRoom - 3) + "...";
-        var pad = inner - label.length - tag.length;
-        if (pad < 0)
-            pad = 0;
+        if (label.length > inner)
+            label = label.substr(0, inner - 3) + "...";
         console.write(gotoRC(l.boxTop + 1, l.boxLeft + 2) +
-            sgr("1;36") + label + repeatByte(" ", pad) +
-            (tag.length ? sgr("1;35") + tag : "") + CLR);
+            sgr("1;36") + label + repeatByte(" ", inner - label.length) + CLR);
     }
-    function drawProgress(l, playedSec, totalSec, paused) {
+    function drawProgress(l, playedSec, totalSec, paused, posTxt) {
         var inner = l.boxWidth - 4;
         var timeTxt = fmtTime(playedSec) + "/" + fmtTime(totalSec);
         var volTxt = paused ? " PAUSED " : (FLPlayer.shuffle ? " SHUF " : "");
-        var barWidth = inner - timeTxt.length - volTxt.length - 2;
-        if (barWidth < 8) {
+        var posSeg = posTxt.length ? " " + posTxt : ""; // queue position, e.g. " 3/42"
+        var barWidth = inner - timeTxt.length - posSeg.length - volTxt.length - 2;
+        if (barWidth < 8) { // tight: drop the volume tag first
             volTxt = "";
+            barWidth = inner - timeTxt.length - posSeg.length - 2;
+        }
+        if (barWidth < 8) { // still tight: drop the position too
+            posSeg = "";
             barWidth = inner - timeTxt.length - 2;
         }
         var fill = totalSec > 0 ? clamp(Math.round(barWidth * playedSec / totalSec), 0, barWidth) : 0;
         var bar = sgr(paused ? "1;33" : "1;37") + repeatByte("\xDB", fill) +
             sgr("0;34") + repeatByte("\xB0", barWidth - fill) + CLR;
         console.write(gotoRC(l.boxTop + 2, l.boxLeft + 2) +
-            bar + " " + sgr("0;37") + timeTxt + sgr(paused ? "1;33" : "0;36") + volTxt + CLR);
+            bar + " " + sgr("0;37") + timeTxt +
+            (posSeg.length ? sgr("1;35") + posSeg : "") +
+            sgr(paused ? "1;33" : "0;36") + volTxt + CLR);
     }
     // Hint bar with three luminance tiers -- dim separators ("[" "]" "/"),
     // medium labels, bright hotkeys -- and a hue that cycles on the beat.
@@ -3554,7 +3545,9 @@ var FLPlayer;
                 }
                 if (bgPainted)
                     drawHints(l, hintTriad);
-                drawProgress(l, clamp(playMs / 1000, 0, totalSec), totalSec, paused);
+                var posTxt = (track.queueName && track.queueLen && track.queueLen > 0)
+                    ? (track.queuePos + "/" + track.queueLen) : "";
+                drawProgress(l, clamp(playMs / 1000, 0, totalSec), totalSec, paused, posTxt);
                 var diag = l.cols + "x" + l.rows + " c" + cprSeen + " r" + relayouts;
                 console.write(gotoRC(l.rows, Math.max(1, l.cols - diag.length)) +
                     sgr("0;30;1") + diag + CLR);
@@ -5211,6 +5204,7 @@ var FLPlayer;
             var history = []; // played indices, oldest-first: P returns to the REAL previous track
             var bag = []; // shuffle deck: every queue track plays once before any repeats
             seedBag(bag, curList.length, idx); // first cycle excludes the track already playing
+            var shufCount = 1; // 1-based position within the CURRENT shuffle cycle (1..len, then resets)
             while (bbs.online && !js.terminated) {
                 var cur = curList[idx];
                 // Immediate feedback for the inter-track gap (tag parse +
@@ -5251,8 +5245,10 @@ var FLPlayer;
                     lyrics: timed,
                     flatLyrics: flat,
                     avatars: trackAvatars(cur),
-                    queueName: currentPlaylist, // "" for radio/browse -> no tag shown
-                    queuePos: idx + 1,
+                    queueName: currentPlaylist, // "" for radio/browse -> no count shown
+                    // Shuffle: position within the cycle (1..len, resets each cycle).
+                    // Sequential: natural track number in the list.
+                    queuePos: FLPlayer.shuffle ? shufCount : (idx + 1),
                     queueLen: curList.length
                 };
                 var outcome = FLPlayer.playTrack(playable);
@@ -5288,7 +5284,8 @@ var FLPlayer;
                         if (pick.playlist)
                             FLPlayer.shuffle = false; // play a playlist in its arranged order
                         history = [];
-                        seedBag(bag, curList.length, idx); // fresh queue -> fresh history/shuffle cycle
+                        seedBag(bag, curList.length, idx);
+                        shufCount = 1; // fresh queue -> fresh cycle
                     }
                     console.clear();
                     continue;
@@ -5307,7 +5304,8 @@ var FLPlayer;
                         if (idx >= curList.length)
                             idx = 0;
                         history = [];
-                        seedBag(bag, curList.length, idx); // indices shifted -> reset nav state
+                        seedBag(bag, curList.length, idx);
+                        shufCount = 1; // indices shifted -> reset nav state
                     }
                     else {
                         console.clear();
@@ -5347,10 +5345,14 @@ var FLPlayer;
                     var steps = Math.abs(moves);
                     for (var mv = 0; mv < steps; mv += 1) {
                         if (goBack) {
-                            if (history.length)
+                            if (history.length) {
                                 idx = history.pop();
-                            else if (!FLPlayer.shuffle)
+                                if (FLPlayer.shuffle && shufCount > 1)
+                                    shufCount -= 1; // step back in the cycle
+                            }
+                            else if (!FLPlayer.shuffle) {
                                 idx = (idx - 1 + curList.length) % curList.length;
+                            }
                             // shuffle with no history yet: stay on the current track
                         }
                         else {
@@ -5358,7 +5360,11 @@ var FLPlayer;
                             if (history.length > 500)
                                 history.shift();
                             if (FLPlayer.shuffle && curList.length > 1) {
+                                // An empty bag means shuffleNext starts a NEW cycle:
+                                // the counter resets to 1; otherwise it advances.
+                                var newCycle = bag.length === 0;
                                 idx = shuffleNext(curList.length, idx, bag);
+                                shufCount = newCycle ? 1 : shufCount + 1;
                             }
                             else {
                                 idx = (idx + 1) % curList.length;
@@ -6797,6 +6803,21 @@ var FLPlayer;
                 seenCount += 1;
             }
             cur = nxt;
+        }
+        // Cycle counter (the "3/42" indicator): NEXT must read 1,2,..,len,1,2,..
+        // -- position within the cycle, resetting when the bag reshuffles.
+        var cbag = [];
+        var cidx = 0;
+        var cCount = 1;
+        seedBag(cbag, len, cidx);
+        var want = 1;
+        for (var c = 0; c < len * 3; c += 1) {
+            if (cCount !== want)
+                throw new Error("cycle count " + cCount + " != " + want);
+            var wasEmpty = cbag.length === 0;
+            cidx = shuffleNext(len, cidx, cbag);
+            cCount = wasEmpty ? 1 : cCount + 1;
+            want = want >= len ? 1 : want + 1;
         }
         writeln("shuffle self-test: OK");
     }

@@ -877,40 +877,34 @@ namespace FLPlayer {
 
     function drawTitleLine(l: Layout, track: PlayableTrack): void {
         var inner = l.boxWidth - 4;
-        // Right-aligned playlist tag ("MyList 3/12") -- shown ONLY when the queue
-        // is a playlist, so its presence tells you a playlist is loaded (vs radio).
-        var tag = "";
-        if (track.queueName && track.queueLen && track.queueLen > 0) {
-            var nm = track.queueName.length > 16 ? track.queueName.substr(0, 15) + "\xAF" : track.queueName;
-            tag = nm + " " + track.queuePos + "/" + track.queueLen;
-        }
-        var titleRoom = inner;
-        if (tag.length && inner - tag.length - 1 >= 12) titleRoom = inner - tag.length - 1;
-        else tag = "";                       // too narrow -> drop the tag, keep the title
         var label = "\x0e " + track.title + (track.artist.length ? " - " + track.artist : "");
-        if (label.length > titleRoom)
-            label = label.substr(0, titleRoom - 3) + "...";
-        var pad = inner - label.length - tag.length;
-        if (pad < 0) pad = 0;
+        if (label.length > inner)
+            label = label.substr(0, inner - 3) + "...";
         console.write(gotoRC(l.boxTop + 1, l.boxLeft + 2) +
-            sgr("1;36") + label + repeatByte(" ", pad) +
-            (tag.length ? sgr("1;35") + tag : "") + CLR);
+            sgr("1;36") + label + repeatByte(" ", inner - label.length) + CLR);
     }
 
-    function drawProgress(l: Layout, playedSec: number, totalSec: number, paused: boolean): void {
+    function drawProgress(l: Layout, playedSec: number, totalSec: number, paused: boolean, posTxt: string): void {
         var inner = l.boxWidth - 4;
         var timeTxt = fmtTime(playedSec) + "/" + fmtTime(totalSec);
         var volTxt = paused ? " PAUSED " : (shuffle ? " SHUF " : "");
-        var barWidth = inner - timeTxt.length - volTxt.length - 2;
-        if (barWidth < 8) {
+        var posSeg = posTxt.length ? " " + posTxt : "";     // queue position, e.g. " 3/42"
+        var barWidth = inner - timeTxt.length - posSeg.length - volTxt.length - 2;
+        if (barWidth < 8) {          // tight: drop the volume tag first
             volTxt = "";
+            barWidth = inner - timeTxt.length - posSeg.length - 2;
+        }
+        if (barWidth < 8) {          // still tight: drop the position too
+            posSeg = "";
             barWidth = inner - timeTxt.length - 2;
         }
         var fill = totalSec > 0 ? clamp(Math.round(barWidth * playedSec / totalSec), 0, barWidth) : 0;
         var bar = sgr(paused ? "1;33" : "1;37") + repeatByte("\xDB", fill) +
             sgr("0;34") + repeatByte("\xB0", barWidth - fill) + CLR;
         console.write(gotoRC(l.boxTop + 2, l.boxLeft + 2) +
-            bar + " " + sgr("0;37") + timeTxt + sgr(paused ? "1;33" : "0;36") + volTxt + CLR);
+            bar + " " + sgr("0;37") + timeTxt +
+            (posSeg.length ? sgr("1;35") + posSeg : "") +
+            sgr(paused ? "1;33" : "0;36") + volTxt + CLR);
     }
 
     // Hint bar with three luminance tiers -- dim separators ("[" "]" "/"),
@@ -2333,7 +2327,9 @@ namespace FLPlayer {
                 if (bgPainted)
                     drawHints(l, hintTriad);
 
-                drawProgress(l, clamp(playMs / 1000, 0, totalSec), totalSec, paused);
+                var posTxt = (track.queueName && track.queueLen && track.queueLen > 0)
+                    ? (track.queuePos + "/" + track.queueLen) : "";
+                drawProgress(l, clamp(playMs / 1000, 0, totalSec), totalSec, paused, posTxt);
                 var diag = l.cols + "x" + l.rows + " c" + cprSeen + " r" + relayouts;
                 console.write(gotoRC(l.rows, Math.max(1, l.cols - diag.length)) +
                     sgr("0;30;1") + diag + CLR);
