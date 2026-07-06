@@ -85,45 +85,57 @@ var FLUifcShim;
         console.write(gotoRC(top + 1 + rows, left) + "\xC8" + rep("\xCD", cols - 2) + "\xBC" + sgr("0"));
         return { top: top + 1, left: left + 2, rows: rows, cols: inner };
     }
-    // Map a decoded arrow back to the Synchronet cursor code the menus handle.
-    function arrowCode(a) {
-        if (a === "up")
-            return "\x1e";
-        if (a === "down")
-            return "\x0a";
-        if (a === "left")
-            return "\x1d";
-        if (a === "right")
-            return "\x06";
-        if (a === "pgup")
-            return "\x10";
-        if (a === "pgdn")
-            return "\x0e";
-        if (a === "home")
-            return "\x02";
-        if (a === "end")
-            return "\x05";
-        return "";
-    }
-    // Read a key through the shared pump instead of a raw console.getkey. The
-    // pump decodes arrow ESC-sequences (and cooked cursor codes) into arrows, so
-    // an arrow's leading \x1b no longer reads as a lone Esc that instantly
-    // closes the menu; real Esc still resolves (with the pump's patience).
-    function waitKey() {
-        for (;;) {
-            if (!bbs.online || js.terminated)
-                return ESC;
-            var ev = FLPlayer.pumpShared(150);
-            if (ev.esc)
-                return ESC;
-            if (ev.arrows.length) {
-                var a = arrowCode(ev.arrows[0]);
-                if (a)
-                    return a;
-            }
-            if (ev.keys.length)
-                return ev.keys[0];
+    function shimDbg(msg) {
+        try {
+            if (typeof FLPlayer !== "undefined" && FLPlayer.dbg)
+                FLPlayer.dbg("shim: " + msg);
         }
+        catch (_e) { }
+    }
+    // Read one key. Synchronet may deliver a cursor key already cooked (a single
+    // control byte like \x0a) OR as a raw ESC sequence read byte-by-byte -- in
+    // which case a lone \x1b would otherwise read as Esc and close the menu. So
+    // when we see \x1b we pull the follow-up bytes ourselves and decode the
+    // arrow, mapping it to the cursor code the menu already handles. Uses a
+    // fresh getkey/inkey (no shared pump state that could leak an Esc in).
+    function waitKey() {
+        var k = String(console.getkey(K_NONE) || "");
+        if (k !== "\x1b") {
+            shimDbg("getkey=" + JSON.stringify(k));
+            return k; // normal or cooked cursor key
+        }
+        var b1 = String(console.inkey(K_NONE, 80) || "");
+        if (b1 !== "[" && b1 !== "O") { // lone Esc (or unknown)
+            shimDbg("ESC (b1=" + JSON.stringify(b1) + ")");
+            return ESC;
+        }
+        var b2 = String(console.inkey(K_NONE, 80) || "");
+        shimDbg("ESC seq " + JSON.stringify(b1) + JSON.stringify(b2));
+        if (b2 === "A")
+            return "\x1e"; // up
+        if (b2 === "B")
+            return "\x0a"; // down
+        if (b2 === "H")
+            return "\x02"; // home
+        if (b2 === "F")
+            return "\x03"; // end (shim uses \x03)
+        if (b2 === "1" || b2 === "7") {
+            console.inkey(K_NONE, 40);
+            return "\x02";
+        } // home (ESC[1~/7~)
+        if (b2 === "4" || b2 === "8") {
+            console.inkey(K_NONE, 40);
+            return "\x03";
+        } // end  (ESC[4~/8~)
+        if (b2 === "5") {
+            console.inkey(K_NONE, 40);
+            return "\x10";
+        } // pgup (ESC[5~)
+        if (b2 === "6") {
+            console.inkey(K_NONE, 40);
+            return "\x0e";
+        } // pgdn (ESC[6~)
+        return ""; // left/right/other -> ignore (no close)
     }
     // ---- the shim object ----------------------------------------------------
     function CTX() {
