@@ -213,6 +213,7 @@ namespace FLUifcShim {
     }
 
     var shim: any = {
+        FLSHIM: true,
         help_text: "",
         init: function (title: string, mode?: string): boolean {
             console.clear();

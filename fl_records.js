@@ -231,6 +231,7 @@ var FLUifcShim;
         return -1;
     }
     var shim = {
+        FLSHIM: true,
         help_text: "",
         init: function (title, mode) {
             console.clear();
@@ -5165,6 +5166,9 @@ var FLPlayer;
                     dirty = false;
                 }
                 var ev = FLPlayer.pumpShared(120);
+                if (ev.esc || ev.keys.length || ev.arrows.length || ev.other.length)
+                    FLPlayer.dbg("browse pump: esc=" + ev.esc + " arrows=[" + ev.arrows.join(",") +
+                        "] keys=" + JSON.stringify(ev.keys) + " other=" + JSON.stringify(ev.other));
                 if (ev.esc || ev.keys.length || ev.arrows.length)
                     dirty = true;
                 if (ev.esc) {
@@ -6099,6 +6103,8 @@ var FLPlayer;
         }
         var app = createAppState();
         activeApp = app;
+        FLPlayer.dbg("startup: uifc type=" + (typeof uifc) +
+            " FLSHIM=" + (typeof uifc !== "undefined" && uifc ? !!uifc.FLSHIM : "n/a"));
         try {
             app.catalog = loadCatalog(false);
             app.cowriters = loadCowriters();

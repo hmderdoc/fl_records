@@ -1980,6 +1980,9 @@ interface AppState {
                 }
 
                 var ev = FLPlayer.pumpShared(120);
+                if (ev.esc || ev.keys.length || ev.arrows.length || ev.other.length)
+                    FLPlayer.dbg("browse pump: esc=" + ev.esc + " arrows=[" + ev.arrows.join(",") +
+                        "] keys=" + JSON.stringify(ev.keys) + " other=" + JSON.stringify(ev.other));
                 if (ev.esc || ev.keys.length || ev.arrows.length) dirty = true;
                 if (ev.esc) {
                     if (search.length) { search = ""; sel = 0; recompute(); }
@@ -2827,6 +2830,8 @@ interface AppState {
         }
         var app = createAppState();
         activeApp = app;
+        FLPlayer.dbg("startup: uifc type=" + (typeof uifc) +
+            " FLSHIM=" + (typeof uifc !== "undefined" && uifc ? !!(uifc as any).FLSHIM : "n/a"));
         try {
             app.catalog = loadCatalog(false);
             app.cowriters = loadCowriters();
