@@ -1032,7 +1032,7 @@ namespace FLPlayer {
     // shade/color follow loudness/brightness, with a bright strobe flash
     // decaying over a few frames on hard beats. The lyric line, glow strips,
     // box and hints rows are never touched. [B] cycles auto/checker/strobe/off.
-    var BG_MODES = ["auto", "checker", "plasma", "ripple", "tunnel", "starfield", "matrix", "fire", "equalizer", "spiral", "aurora", "sweep", "strobe", "off"];
+    var BG_MODES = ["auto", "checker", "plasma", "ripple", "tunnel", "starfield", "lyrics", "fire", "equalizer", "spiral", "aurora", "sweep", "strobe", "off"];
 
     interface Rect { x: number; y: number; w: number; h: number; }
 
@@ -1214,7 +1214,7 @@ namespace FLPlayer {
 
     // Generic per-cell paint: fn(x,y) -> [sgr, char] | null (null = blank). Sets
     // bgCellFn so text rides on top, then paints the margin cells. Used by the
-    // sparse effects (starfield, matrix) that place characters, not fill fields.
+    // sparse effects (starfield, lyric rain) that place characters, not fill fields.
     function cellPaint(rects: Rect[], fn: (x: number, y: number) => string[] | null): void {
         bgCellFn = fn;
         var out = "";
@@ -1278,29 +1278,52 @@ namespace FLPlayer {
         });
     }
 
-    // Matrix rain: glyph columns fall, head white, tail fading green. Drop rate
-    // and fall speed follow loudness; beats seed a fresh burst.
-    interface Drop { col: number; head: number; len: number; speed: number; }
-    var MATRIX_CHARS = "0123456789ABCDEF<>|/\\=+*#%\xB1\xF4\xE0\xEA\xE7\x9E";
-    function stepMatrix(drops: Drop[], cols: number, rows: number, top: number, rms: number, beat: boolean): void {
-        if (drops.length < cols + 8 && (Math.random() < 0.15 + rms * 0.45 || beat))
-            drops.push({
-                col: 1 + Math.floor(Math.random() * cols), head: top,
-                len: 4 + Math.floor(Math.random() * 9), speed: 0.4 + Math.random() * 0.9
-            });
+    // Lyric rain: instead of played-out random glyphs, WORDS from the current
+    // lyric line fall as cyan streams (brightest at the leading edge). On beats
+    // the falling characters flash to green binary (0/1) -- the words "digitize"
+    // to the music, then resolve back to letters as the beat decays. Fed only
+    // while a lyric line is active, and kept out of the auto-rotation entirely
+    // on instrumental tracks, so it rains vocals rather than noise.
+    interface LyricDrop { col: number; head: number; text: string; speed: number; glitch: number; }
+    function rainWord(src: string): string {
+        var words = src.split(" ");
+        var w = "";
+        for (var tries = 0; tries < 6 && !w; tries++) {
+            var cand = words[Math.floor(Math.random() * words.length)] || "";
+            w = cand.replace(/[^\x21-\x7e]/g, "");     // printable ASCII only (vertical text)
+        }
+        return w.length > 12 ? w.substr(0, 12) : w;
+    }
+    function stepLyricRain(drops: LyricDrop[], cols: number, rows: number, top: number,
+        rms: number, beat: boolean, src: string): void {
+        if (src && drops.length < cols + 6 && (Math.random() < 0.22 + rms * 0.5 || beat)) {
+            var w = rainWord(src);
+            if (w)
+                drops.push({
+                    col: 1 + Math.floor(Math.random() * cols), head: top, text: w,
+                    speed: 0.3 + Math.random() * 0.5, glitch: 0
+                });
+        }
         for (var i = drops.length - 1; i >= 0; i--) {
-            drops[i].head += drops[i].speed * (0.6 + rms * 1.3);
-            if (drops[i].head - drops[i].len > rows) drops.splice(i, 1);
+            var d = drops[i];
+            d.head += d.speed * (0.5 + rms * 0.9);       // slow enough that words stay readable
+            d.glitch = beat ? Math.min(1, d.glitch + 0.6) : d.glitch * 0.82;   // beats digitize
+            if (d.head - d.text.length > rows) drops.splice(i, 1);
         }
     }
-    function drawMatrix(rects: Rect[], drops: Drop[]): void {
+    function drawLyricRain(rects: Rect[], drops: LyricDrop[]): void {
         var map: { [k: string]: string[] } = {};
         for (var i = 0; i < drops.length; i++) {
             var d = drops[i];
             var h = Math.floor(d.head);
-            for (var t = 0; t < d.len; t++) {
-                var ch = MATRIX_CHARS.charAt(Math.floor(Math.random() * MATRIX_CHARS.length));
-                map[d.col + "," + (h - t)] = [t === 0 ? "1;37" : t < 3 ? "1;32" : "0;32", ch];
+            var len = d.text.length;
+            for (var t = 0; t < len; t++) {
+                var row = h - (len - 1) + t;             // word reads top->bottom, head at bottom
+                var dist = (len - 1) - t;                // 0 at the bright leading edge
+                if (d.glitch > 0 && Math.random() < d.glitch)
+                    map[d.col + "," + row] = ["1;32", Math.random() < 0.5 ? "0" : "1"];   // binary flash
+                else
+                    map[d.col + "," + row] = [dist === 0 ? "1;37" : dist < 3 ? "1;36" : "0;36", d.text.charAt(t)];
             }
         }
         cellPaint(rects, function (x: number, y: number): string[] | null {
@@ -1728,12 +1751,15 @@ namespace FLPlayer {
         var secBaseZcr = 0;
         var lastFeatChunk = -1;
         var spriteMode = 0;          // avatar motion mode, rotates with the effect
-        var AUTO_EFFECTS = ["checker", "plasma", "ripple", "tunnel", "starfield", "matrix", "fire", "equalizer", "spiral", "aurora", "sweep"];
+        var AUTO_EFFECTS = ["checker", "plasma", "ripple", "tunnel", "starfield", "fire", "equalizer", "spiral", "aurora", "sweep"];
+        // "lyrics" (lyric rain) is appended to the pool below, but only when the
+        // track actually has lyrics -- so instrumental tracks never rotate to it.
         var autoIdx = Math.floor(Math.random() * AUTO_EFFECTS.length);  // random start, random switches
         var tunnelT = 0;             // tunnel scroll phase
         var waveT = 0;               // spiral / aurora phase
         var stars: Star[] = [];      // starfield warp points
-        var matrixDrops: Drop[] = [];// matrix rain columns
+        var lyricDrops: LyricDrop[] = [];  // lyric-rain word streams
+        var rainSrc = "";            // last active lyric line (rain material; persists gaps)
         var fireHeat: { [k: string]: number } = {};  // fire heat field
         var eqBars: number[] = [];   // equaliser bar heights (per column)
         var eqPeaks: number[] = [];  // equaliser peak-hold caps
@@ -1771,6 +1797,8 @@ namespace FLPlayer {
         var lyrics: LyricLine[] = track.lyrics && track.lyrics.length
             ? track.lyrics
             : distributeLyrics(track.flatLyrics || "", totalSec);
+        if (lyrics.length)
+            AUTO_EFFECTS.push("lyrics");   // rain the vocals -- only on tracks that have them
         // Size the lyric strip to this track's longest line so a wide terminal
         // shows full lines instead of ellipsis. Per track (stable across lines),
         // never narrower than the box; the glow/viz bars keep the box width.
@@ -1812,7 +1840,7 @@ namespace FLPlayer {
             margins = marginRects(l, blit);
             lyricIdx = -1;      // repaint the lyric row after the redraw
             rings = [];
-            stars = []; matrixDrops = []; fireHeat = {};   // positions were screen-relative
+            stars = []; lyricDrops = []; fireHeat = {};   // positions were screen-relative
             eqBars = []; eqPeaks = [];
             wipeActive = false;
             redrawAll();
@@ -2193,9 +2221,12 @@ namespace FLPlayer {
                         stepStars(stars, STAR_COUNT, fxCx, fxCy, l.cols, l.rows, l.artTop, features.rms);
                         drawStars(margins, stars, fxCx, fxCy);
                         bgPainted = true;
-                    } else if (bg === "matrix") {
-                        stepMatrix(matrixDrops, l.cols, l.rows, l.artTop, features.rms, beat);
-                        drawMatrix(margins, matrixDrops);
+                    } else if (bg === "lyrics") {
+                        // feed the current line (persist the last one through gaps)
+                        if (lyricIdx >= 0 && lyrics[lyricIdx] && lyrics[lyricIdx].text)
+                            rainSrc = lyrics[lyricIdx].text;
+                        stepLyricRain(lyricDrops, l.cols, l.rows, l.artTop, features.rms, beat, rainSrc);
+                        drawLyricRain(margins, lyricDrops);
                         bgPainted = true;
                     } else if (bg === "fire") {
                         drawFire(margins, fireHeat, l.cols, l.rows, l.artTop, features.rms, beat);

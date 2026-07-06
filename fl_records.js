@@ -2209,7 +2209,7 @@ var FLPlayer;
     // shade/color follow loudness/brightness, with a bright strobe flash
     // decaying over a few frames on hard beats. The lyric line, glow strips,
     // box and hints rows are never touched. [B] cycles auto/checker/strobe/off.
-    var BG_MODES = ["auto", "checker", "plasma", "ripple", "tunnel", "starfield", "matrix", "fire", "equalizer", "spiral", "aurora", "sweep", "strobe", "off"];
+    var BG_MODES = ["auto", "checker", "plasma", "ripple", "tunnel", "starfield", "lyrics", "fire", "equalizer", "spiral", "aurora", "sweep", "strobe", "off"];
     function marginRects(l, blit) {
         var rects = [];
         var zoneTop = l.artTop;
@@ -2376,7 +2376,7 @@ var FLPlayer;
     }
     // Generic per-cell paint: fn(x,y) -> [sgr, char] | null (null = blank). Sets
     // bgCellFn so text rides on top, then paints the margin cells. Used by the
-    // sparse effects (starfield, matrix) that place characters, not fill fields.
+    // sparse effects (starfield, lyric rain) that place characters, not fill fields.
     function cellPaint(rects, fn) {
         bgCellFn = fn;
         var out = "";
@@ -2437,27 +2437,45 @@ var FLPlayer;
             return map[x + "," + y] || null;
         });
     }
-    var MATRIX_CHARS = "0123456789ABCDEF<>|/\\=+*#%\xB1\xF4\xE0\xEA\xE7\x9E";
-    function stepMatrix(drops, cols, rows, top, rms, beat) {
-        if (drops.length < cols + 8 && (Math.random() < 0.15 + rms * 0.45 || beat))
-            drops.push({
-                col: 1 + Math.floor(Math.random() * cols), head: top,
-                len: 4 + Math.floor(Math.random() * 9), speed: 0.4 + Math.random() * 0.9
-            });
+    function rainWord(src) {
+        var words = src.split(" ");
+        var w = "";
+        for (var tries = 0; tries < 6 && !w; tries++) {
+            var cand = words[Math.floor(Math.random() * words.length)] || "";
+            w = cand.replace(/[^\x21-\x7e]/g, ""); // printable ASCII only (vertical text)
+        }
+        return w.length > 12 ? w.substr(0, 12) : w;
+    }
+    function stepLyricRain(drops, cols, rows, top, rms, beat, src) {
+        if (src && drops.length < cols + 6 && (Math.random() < 0.22 + rms * 0.5 || beat)) {
+            var w = rainWord(src);
+            if (w)
+                drops.push({
+                    col: 1 + Math.floor(Math.random() * cols), head: top, text: w,
+                    speed: 0.3 + Math.random() * 0.5, glitch: 0
+                });
+        }
         for (var i = drops.length - 1; i >= 0; i--) {
-            drops[i].head += drops[i].speed * (0.6 + rms * 1.3);
-            if (drops[i].head - drops[i].len > rows)
+            var d = drops[i];
+            d.head += d.speed * (0.5 + rms * 0.9); // slow enough that words stay readable
+            d.glitch = beat ? Math.min(1, d.glitch + 0.6) : d.glitch * 0.82; // beats digitize
+            if (d.head - d.text.length > rows)
                 drops.splice(i, 1);
         }
     }
-    function drawMatrix(rects, drops) {
+    function drawLyricRain(rects, drops) {
         var map = {};
         for (var i = 0; i < drops.length; i++) {
             var d = drops[i];
             var h = Math.floor(d.head);
-            for (var t = 0; t < d.len; t++) {
-                var ch = MATRIX_CHARS.charAt(Math.floor(Math.random() * MATRIX_CHARS.length));
-                map[d.col + "," + (h - t)] = [t === 0 ? "1;37" : t < 3 ? "1;32" : "0;32", ch];
+            var len = d.text.length;
+            for (var t = 0; t < len; t++) {
+                var row = h - (len - 1) + t; // word reads top->bottom, head at bottom
+                var dist = (len - 1) - t; // 0 at the bright leading edge
+                if (d.glitch > 0 && Math.random() < d.glitch)
+                    map[d.col + "," + row] = ["1;32", Math.random() < 0.5 ? "0" : "1"]; // binary flash
+                else
+                    map[d.col + "," + row] = [dist === 0 ? "1;37" : dist < 3 ? "1;36" : "0;36", d.text.charAt(t)];
             }
         }
         cellPaint(rects, function (x, y) {
@@ -2932,12 +2950,15 @@ var FLPlayer;
         var secBaseZcr = 0;
         var lastFeatChunk = -1;
         var spriteMode = 0; // avatar motion mode, rotates with the effect
-        var AUTO_EFFECTS = ["checker", "plasma", "ripple", "tunnel", "starfield", "matrix", "fire", "equalizer", "spiral", "aurora", "sweep"];
+        var AUTO_EFFECTS = ["checker", "plasma", "ripple", "tunnel", "starfield", "fire", "equalizer", "spiral", "aurora", "sweep"];
+        // "lyrics" (lyric rain) is appended to the pool below, but only when the
+        // track actually has lyrics -- so instrumental tracks never rotate to it.
         var autoIdx = Math.floor(Math.random() * AUTO_EFFECTS.length); // random start, random switches
         var tunnelT = 0; // tunnel scroll phase
         var waveT = 0; // spiral / aurora phase
         var stars = []; // starfield warp points
-        var matrixDrops = []; // matrix rain columns
+        var lyricDrops = []; // lyric-rain word streams
+        var rainSrc = ""; // last active lyric line (rain material; persists gaps)
         var fireHeat = {}; // fire heat field
         var eqBars = []; // equaliser bar heights (per column)
         var eqPeaks = []; // equaliser peak-hold caps
@@ -2974,6 +2995,8 @@ var FLPlayer;
         var lyrics = track.lyrics && track.lyrics.length
             ? track.lyrics
             : distributeLyrics(track.flatLyrics || "", totalSec);
+        if (lyrics.length)
+            AUTO_EFFECTS.push("lyrics"); // rain the vocals -- only on tracks that have them
         // Size the lyric strip to this track's longest line so a wide terminal
         // shows full lines instead of ellipsis. Per track (stable across lines),
         // never narrower than the box; the glow/viz bars keep the box width.
@@ -3015,7 +3038,7 @@ var FLPlayer;
             lyricIdx = -1; // repaint the lyric row after the redraw
             rings = [];
             stars = [];
-            matrixDrops = [];
+            lyricDrops = [];
             fireHeat = {}; // positions were screen-relative
             eqBars = [];
             eqPeaks = [];
@@ -3418,9 +3441,12 @@ var FLPlayer;
                         drawStars(margins, stars, fxCx, fxCy);
                         bgPainted = true;
                     }
-                    else if (bg === "matrix") {
-                        stepMatrix(matrixDrops, l.cols, l.rows, l.artTop, features.rms, beat);
-                        drawMatrix(margins, matrixDrops);
+                    else if (bg === "lyrics") {
+                        // feed the current line (persist the last one through gaps)
+                        if (lyricIdx >= 0 && lyrics[lyricIdx] && lyrics[lyricIdx].text)
+                            rainSrc = lyrics[lyricIdx].text;
+                        stepLyricRain(lyricDrops, l.cols, l.rows, l.artTop, features.rms, beat, rainSrc);
+                        drawLyricRain(margins, lyricDrops);
                         bgPainted = true;
                     }
                     else if (bg === "fire") {
