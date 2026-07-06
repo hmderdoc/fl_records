@@ -2455,9 +2455,9 @@ var FLPlayer;
         // Seed the bottom rows with fuel.
         var base = rows;
         for (var x = 1; x <= cols; x++) {
-            var fuel = 0.35 + Math.random() * (0.35 + rms * 0.9) + (beat ? 0.3 : 0);
+            var fuel = 0.5 + Math.random() * (0.4 + rms * 1.0) + (beat ? 0.35 : 0);
             heat[x + "," + base] = Math.min(1, fuel);
-            heat[x + "," + (base - 1)] = Math.min(1, fuel * 0.9);
+            heat[x + "," + (base - 1)] = Math.min(1, fuel * 0.92);
         }
         // Propagate upward with cooling (average of the row below +/- a column).
         var next = {};
@@ -2467,7 +2467,7 @@ var FLPlayer;
                     (heat[(cx2 - 1) + "," + (y + 1)] || 0) +
                     (heat[(cx2 + 1) + "," + (y + 1)] || 0) +
                     (heat[cx2 + "," + (y + 2)] || 0);
-                var v = below / 4 - 0.06;
+                var v = below / 4 - 0.032; // less cooling per row -> flames climb higher
                 if (v > 0.02)
                     next[cx2 + "," + y] = v > 1 ? 1 : v;
             }
