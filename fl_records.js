@@ -85,8 +85,45 @@ var FLUifcShim;
         console.write(gotoRC(top + 1 + rows, left) + "\xC8" + rep("\xCD", cols - 2) + "\xBC" + sgr("0"));
         return { top: top + 1, left: left + 2, rows: rows, cols: inner };
     }
+    // Map a decoded arrow back to the Synchronet cursor code the menus handle.
+    function arrowCode(a) {
+        if (a === "up")
+            return "\x1e";
+        if (a === "down")
+            return "\x0a";
+        if (a === "left")
+            return "\x1d";
+        if (a === "right")
+            return "\x06";
+        if (a === "pgup")
+            return "\x10";
+        if (a === "pgdn")
+            return "\x0e";
+        if (a === "home")
+            return "\x02";
+        if (a === "end")
+            return "\x05";
+        return "";
+    }
+    // Read a key through the shared pump instead of a raw console.getkey. The
+    // pump decodes arrow ESC-sequences (and cooked cursor codes) into arrows, so
+    // an arrow's leading \x1b no longer reads as a lone Esc that instantly
+    // closes the menu; real Esc still resolves (with the pump's patience).
     function waitKey() {
-        return String(console.getkey(K_NONE) || "");
+        for (;;) {
+            if (!bbs.online || js.terminated)
+                return ESC;
+            var ev = FLPlayer.pumpShared(150);
+            if (ev.esc)
+                return ESC;
+            if (ev.arrows.length) {
+                var a = arrowCode(ev.arrows[0]);
+                if (a)
+                    return a;
+            }
+            if (ev.keys.length)
+                return ev.keys[0];
+        }
     }
     // ---- the shim object ----------------------------------------------------
     function CTX() {
