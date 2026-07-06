@@ -489,12 +489,26 @@ namespace FLPlayer {
     export function readKey(ms: number): string {
         var k = console.inkey(K_NOECHO | K_NOSPIN, ms);
         if (typeof k !== "string" || !k.length) return "";
-        if (k === "\x1b") {                 // a sequence may have split: grab the rest
-            var more = console.inkey(K_NOECHO | K_NOSPIN, 30);
-            if (typeof more === "string" && more.length) k += more;
-            if (k === "\x1b") return "\x1b"; // truly a lone Esc
+        if (k.length > 1) { dbg("readKey whole=" + JSON.stringify(k)); return normalizeKey(k); }
+        if (k !== "\x1b") return k;          // cooked cursor code or a plain key
+        // ESC: inkey here delivers the sequence byte-by-byte, so ASSEMBLE the
+        // rest of a CSI ("[ ... final") or SS3 ("O <letter>") before deciding.
+        // Without this the "[" and "B" of a down arrow leak in as typed text.
+        var seq = "";
+        for (var i = 0; i < 8; i += 1) {
+            var c = console.inkey(K_NOECHO | K_NOSPIN, 60);
+            if (typeof c !== "string" || !c.length) break;   // nothing more -> lone Esc/partial
+            seq += c;
+            if (seq.charAt(0) !== "[" && seq.charAt(0) !== "O") break;    // not an escape sequence
+            if (seq.charAt(0) === "O") { if (seq.length >= 2) break; else continue; }
+            if (seq.length >= 2) {                                        // CSI: stop at the final byte
+                var last = seq.charAt(seq.length - 1);
+                if (last >= "@" && last <= "~" && !(last >= "0" && last <= "9") && last !== ";") break;
+            }
         }
-        return normalizeKey(k);
+        dbg("readKey ESC seq=" + JSON.stringify(seq));
+        if (!seq.length) return "\x1b";       // a genuine lone Esc
+        return normalizeKey("\x1b" + seq);
     }
 
     // ---- sink detection ---------------------------------------------------
