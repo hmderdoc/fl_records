@@ -758,6 +758,42 @@ namespace FLPlayer {
             blit.srcRow, blit.nRows, blit.srcCol, blit.nCols, palFor));
     }
 
+    // Video-style wipe geometries. Given progress p (0..1) and the region bounds,
+    // return true where the wipe has passed (the NEW side). One is chosen at
+    // random per transition so wipes look different every time.
+    interface WipeBounds { x0: number; x1: number; y0: number; y1: number; cx: number; cy: number; maxR: number; }
+    var WIPES: ((x: number, y: number, p: number, b: WipeBounds) => boolean)[] = [
+        function (x, y, p, b) { return (x - b.x0) <= p * (b.x1 - b.x0 + 1); },              // left -> right
+        function (x, y, p, b) { return (b.x1 - x) <= p * (b.x1 - b.x0 + 1); },              // right -> left
+        function (x, y, p, b) { return (y - b.y0) <= p * (b.y1 - b.y0 + 1); },              // top -> bottom
+        function (x, y, p, b) { return (b.y1 - y) <= p * (b.y1 - b.y0 + 1); },              // bottom -> top
+        function (x, y, p, b) {                                                              // diagonal TL -> BR
+            return ((x - b.x0) / (b.x1 - b.x0 + 1) + (y - b.y0) / (b.y1 - b.y0 + 1)) * 0.5 <= p;
+        },
+        function (x, y, p, b) {                                                              // diagonal TR -> BL
+            return ((b.x1 - x) / (b.x1 - b.x0 + 1) + (y - b.y0) / (b.y1 - b.y0 + 1)) * 0.5 <= p;
+        },
+        function (x, y, p, b) {                                                              // radial out
+            var dx = (x - b.cx) * 0.5, dy = y - b.cy; return Math.sqrt(dx * dx + dy * dy) * 2 <= p * b.maxR;
+        },
+        function (x, y, p, b) {                                                              // radial in
+            var dx = (x - b.cx) * 0.5, dy = y - b.cy; return Math.sqrt(dx * dx + dy * dy) * 2 >= (1 - p) * b.maxR;
+        },
+        function (x, y, p, b) { return Math.abs(x - b.cx) <= p * (b.x1 - b.x0 + 1) * 0.5; }, // barn door (H split)
+        function (x, y, p, b) { return Math.abs(y - b.cy) <= p * (b.y1 - b.y0 + 1) * 0.5; }, // barn door (V split)
+        function (x, y, p, b) { return (((y - b.y0) % 5) / 5) <= p; },                       // venetian blinds
+        function (x, y, p, b) { return (((x - b.x0) % 6) / 6) <= p; }                        // vertical blinds
+    ];
+
+    function wipeBoundsFor(x0: number, y0: number, x1: number, y1: number): WipeBounds {
+        var hw = (x1 - x0 + 1) * 0.25, hh = (y1 - y0 + 1) * 0.5;
+        return {
+            x0: x0, y0: y0, x1: x1, y1: y1,
+            cx: (x0 + x1) / 2, cy: (y0 + y1) / 2,
+            maxR: Math.sqrt(hw * hw + hh * hh) * 2 + 3
+        };
+    }
+
     /** Restore the backdrop over a screen rect: art cells where the rect
      *  overlaps the art blit; elsewhere a "wake" — a colored shade (the
      *  sprite's trail) that the next background repaint dissolves. */
@@ -981,7 +1017,7 @@ namespace FLPlayer {
     // shade/color follow loudness/brightness, with a bright strobe flash
     // decaying over a few frames on hard beats. The lyric line, glow strips,
     // box and hints rows are never touched. [B] cycles auto/checker/strobe/off.
-    var BG_MODES = ["auto", "checker", "plasma", "ripple", "tunnel", "starfield", "matrix", "fire", "equalizer", "spiral", "aurora", "strobe", "off"];
+    var BG_MODES = ["auto", "checker", "plasma", "ripple", "tunnel", "starfield", "matrix", "fire", "equalizer", "spiral", "aurora", "sweep", "strobe", "off"];
 
     interface Rect { x: number; y: number; w: number; h: number; }
 
@@ -1348,6 +1384,19 @@ namespace FLPlayer {
         });
     }
 
+    // Background sweep: a bright band wipes across the margins (a random wipe
+    // geometry) leaving a fading trail, and re-fires in a new direction on each
+    // beat -- the "wipe" idea applied to the whole backdrop.
+    function drawSweep(rects: Rect[], p: number, geoIdx: number, zcr: number, b: WipeBounds): void {
+        var g = WIPES[geoIdx % WIPES.length];
+        fieldPaint(rects, zcr, function (x: number, y: number): number {
+            if (!g(x, y, p, b)) return 0.08;                 // ahead of the front: faint wash
+            if (!g(x, y, p - 0.12, b)) return 1;             // the leading band: bright
+            if (!g(x, y, p - 0.35, b)) return 0.5;           // recent trail
+            return 0.2;                                       // settled trail
+        });
+    }
+
     // ---- floating avatar sprites ---------------------------------------------
     // Avatars drift over the art like a screensaver, bounce off the art-zone
     // walls and each other, speed up with loudness, and get a velocity kick
@@ -1607,17 +1656,18 @@ namespace FLPlayer {
         var palStep = 0;
         // Art-swap styles (rotate with the effect): pulse = step the palette on
         // beats; rotate = quick full-colour cycle bursts; wipe = fill the next
-        // palette in symmetrically (centre-out / edge-in).
-        var ART_SWAP_MODES = ["pulse", "rotate", "wipe"];
-        var artSwapMode = 0;
-        var artRot = 0;                   // rotate: colour-wheel phase
-        var artRotFrames = 0;             // rotate: rapid-cycle frames left after a beat
+        // random wipe geometry. Each beat rolls a transition (mostly a wipe).
+        var artRot = 0;                   // flash: colour-wheel phase
+        var artRotFrames = 0;             // flash: rapid-cycle frames left after a beat
         var wipeActive = false;
-        var wipeFront = 0;
-        var wipeMaxR = 1;
+        var wipeProg = 0;                 // 0..1 progress of the active wipe
+        var wipeStep = 0.12;
+        var wipeGeo = 0;                  // WIPES index
         var wipeOld = 0;
         var wipeNew = 0;
-        var wipeStyle = 0;                // 0 = centre-out, 1 = edge-in
+        var wipeBounds: WipeBounds = wipeBoundsFor(0, 0, 0, 0);
+        var sweepP = 0;                   // bg "sweep" effect progress
+        var sweepGeo = 0;
         var margins: Rect[] = [];
         var checkerPhase = 0;
         var checkerDirty = true;
@@ -1643,7 +1693,7 @@ namespace FLPlayer {
         var lastFeatChunk = -1;
         var autoIdx = 0;              // auto rotation through the field/ascii effects
         var spriteMode = 0;          // avatar motion mode, rotates with the effect
-        var AUTO_EFFECTS = ["checker", "plasma", "ripple", "tunnel", "starfield", "matrix", "fire", "equalizer", "spiral", "aurora"];
+        var AUTO_EFFECTS = ["checker", "plasma", "ripple", "tunnel", "starfield", "matrix", "fire", "equalizer", "spiral", "aurora", "sweep"];
         var tunnelT = 0;             // tunnel scroll phase
         var waveT = 0;               // spiral / aurora phase
         var stars: Star[] = [];      // starfield warp points
@@ -1965,7 +2015,6 @@ namespace FLPlayer {
                         lastAutoSwitchAt = now;
                         autoIdx = (autoIdx + 1) % AUTO_EFFECTS.length;
                         spriteMode = (spriteMode + 1) % SPRITE_MODES.length;   // vary avatar physics too
-                        artSwapMode = (artSwapMode + 1) % ART_SWAP_MODES.length; // and the art-swap style
                         wipeActive = false;
                         rings = [];
                         checkerDirty = true;
@@ -1977,53 +2026,41 @@ namespace FLPlayer {
                 // set of distinct permutation maps that keeps returning to the
                 // true palette; rate-capped so slow links keep breathing room).
                 if (mode === "glow+art" && blit.grid && !paused) {
-                    var swap = ART_SWAP_MODES[artSwapMode];
-                    if (swap === "rotate") {
-                        // Quick full-colour cycles: a short burst of rotation
-                        // frames on each beat (all colours at once, grays too).
-                        if (beat) artRotFrames = 4;
-                        if (artRotFrames > 0) {
-                            artRot = (artRot + 4 + Math.floor(features.rms * 8)) % 15;
-                            if (artRot === 0) artRot = 1;
-                            drawArtFlash(blit, artRot);
-                            drawSprites(sprites, l, blit, true);
-                            artRotFrames--;
-                            if (artRotFrames === 0) { drawArt(blit); drawSprites(sprites, l, blit, true); }
-                        }
-                    } else if (swap === "wipe") {
-                        // Timed symmetric fill: sweep the next palette in.
-                        if (!wipeActive && beat && now - artFlashAt > 550) {
-                            artFlashAt = now;
-                            wipeActive = true; wipeFront = 0;
-                            wipeOld = blit.pal;
-                            palStep = PALETTE_SEQ.length ? (palStep + 1) % PALETTE_SEQ.length : 0;
-                            wipeNew = PALETTE_SEQ.length ? PALETTE_SEQ[palStep] : 0;
-                            wipeStyle = (wipeStyle + 1) % 2;
-                            var hw = blit.nCols * 0.25, hh = blit.nRows * 0.5;
-                            wipeMaxR = Math.sqrt(hw * hw + hh * hh) * 2 + 3;
-                        }
-                        if (wipeActive) {
-                            wipeFront += wipeMaxR / 9;
-                            var acx = blit.left + blit.nCols / 2;
-                            var acy = blit.top + blit.nRows / 2;
-                            var frontR = wipeFront, oldP = wipeOld, newP = wipeNew;
-                            var edgeIn = wipeStyle === 1, maxR = wipeMaxR;
-                            drawArtWipe(blit, function (x: number, y: number): number {
-                                var dx = (x - acx) * 0.5, dy = y - acy;
-                                var d = Math.sqrt(dx * dx + dy * dy) * 2;
-                                var isNew = edgeIn ? (d >= maxR - frontR) : (d <= frontR);
-                                return isNew ? newP : oldP;
-                            });
-                            drawSprites(sprites, l, blit, true);
-                            if (wipeFront >= wipeMaxR + 2) { wipeActive = false; blit.pal = wipeNew; }
-                        }
-                    } else {   // pulse: step the palette on beats (all at once)
-                        if (beat && now - artFlashAt > 420) {
-                            artFlashAt = now;
-                            palStep = PALETTE_SEQ.length ? (palStep + 1) % PALETTE_SEQ.length : 0;
-                            blit.pal = PALETTE_SEQ.length ? PALETTE_SEQ[palStep] : 0;
-                            drawArt(blit);
-                            drawSprites(sprites, l, blit, true);
+                    if (wipeActive) {
+                        // Advance the active video-style wipe (random geometry).
+                        wipeProg += wipeStep;
+                        var wg = WIPES[wipeGeo], wp = wipeProg, wo = wipeOld, wn = wipeNew, wb = wipeBounds;
+                        drawArtWipe(blit, function (x: number, y: number): number {
+                            return wg(x, y, wp, wb) ? wn : wo;
+                        });
+                        drawSprites(sprites, l, blit, true);
+                        if (wipeProg >= 1) { wipeActive = false; blit.pal = wipeNew; }
+                    } else if (artRotFrames > 0) {
+                        // Quick full-colour cycle burst (all colours at once).
+                        artRot = (artRot + 4 + Math.floor(features.rms * 8)) % 15;
+                        if (artRot === 0) artRot = 1;
+                        drawArtFlash(blit, artRot);
+                        drawSprites(sprites, l, blit, true);
+                        artRotFrames--;
+                        if (artRotFrames === 0) { drawArt(blit); drawSprites(sprites, l, blit, true); }
+                    } else if (beat && now - artFlashAt > 460) {
+                        // New transition on the beat: mostly a wipe (random
+                        // direction), sometimes an instant swap or a flash burst.
+                        artFlashAt = now;
+                        palStep = PALETTE_SEQ.length ? (palStep + 1) % PALETTE_SEQ.length : 0;
+                        var target = PALETTE_SEQ.length ? PALETTE_SEQ[palStep] : 0;
+                        var roll = Math.random();
+                        if (roll < 0.16) {                       // instant
+                            blit.pal = target; drawArt(blit); drawSprites(sprites, l, blit, true);
+                        } else if (roll < 0.30) {                // flash burst
+                            blit.pal = target; artRotFrames = 4;
+                        } else {                                 // WIPE (random geometry) -- the majority
+                            wipeActive = true; wipeProg = 0;
+                            wipeGeo = Math.floor(Math.random() * WIPES.length);
+                            wipeOld = blit.pal; wipeNew = target;
+                            wipeBounds = wipeBoundsFor(blit.left, blit.top,
+                                blit.left + blit.nCols - 1, blit.top + blit.nRows - 1);
+                            wipeStep = 1 / (6 + Math.floor(Math.random() * 6));   // ~6-11 frames
                         }
                     }
                 }
@@ -2129,6 +2166,15 @@ namespace FLPlayer {
                             drawAurora(margins, waveT, features.zcr);
                             bgPainted = true;
                         }
+                    } else if (bg === "sweep") {
+                        sweepP += 0.06 + features.rms * 0.14;
+                        if ((beat && sweepP > 0.5) || sweepP > 1.35) {
+                            sweepP = 0;
+                            sweepGeo = Math.floor(Math.random() * WIPES.length);
+                        }
+                        drawSweep(margins, sweepP, sweepGeo, features.zcr,
+                            wipeBoundsFor(1, l.artTop, l.cols, l.artBottom));
+                        bgPainted = true;
                     }
                 }
 
