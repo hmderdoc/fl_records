@@ -1690,10 +1690,16 @@ namespace FLPlayer {
         // which drive the auto background rotation.
         var emaFast = -1;
         var emaSlow = -1;
+        // ~3s envelopes of energy + brightness for SECTION detection (verse /
+        // chorus / bridge shifts), and their value at the last effect switch.
+        var secRms = -1;
+        var secZcr = -1;
+        var secBaseRms = 0;
+        var secBaseZcr = 0;
         var lastFeatChunk = -1;
-        var autoIdx = 0;              // auto rotation through the field/ascii effects
         var spriteMode = 0;          // avatar motion mode, rotates with the effect
         var AUTO_EFFECTS = ["checker", "plasma", "ripple", "tunnel", "starfield", "matrix", "fire", "equalizer", "spiral", "aurora", "sweep"];
+        var autoIdx = Math.floor(Math.random() * AUTO_EFFECTS.length);  // random start, random switches
         var tunnelT = 0;             // tunnel scroll phase
         var waveT = 0;               // spiral / aurora phase
         var stars: Star[] = [];      // starfield warp points
@@ -1998,22 +2004,37 @@ namespace FLPlayer {
                     hardBeat = features.raw > emaFast * 1.55 + 0.03;
                     emaFast = emaFast * 0.7 + features.raw * 0.3;
                     emaSlow = emaSlow * 0.95 + features.raw * 0.05;
+                    if (secRms < 0) {
+                        secRms = features.raw; secZcr = features.zcr;
+                        secBaseRms = secRms; secBaseZcr = secZcr;
+                    }
+                    secRms = secRms * 0.9 + features.raw * 0.1;    // ~3s envelope
+                    secZcr = secZcr * 0.9 + features.zcr * 0.1;
                 }
                 if (beat)
                     borderPulse = 3;
                 lastRms = features.rms;
 
-                // Auto background rotation on musical transitions: the local
-                // level diverging from the passage energy (quiet->loud or
-                // loud->quiet) advances the effect, with a 30s variety
-                // fallback so long steady passages still evolve. The switch
+                // Switch effect on SECTION changes, not a plain timer: when the
+                // ~3s energy or brightness (melody-height proxy) envelope has
+                // drifted well away from what it was at the last switch (a
+                // verse<->chorus<->bridge shift), debounced by a 5s floor. A long
+                // steady section still rotates on the 24s fallback. The switch
                 // announces itself with a strobe flash.
-                if (BG_MODES[bgMode] === "auto" && !paused && emaSlow > 0) {
+                if (BG_MODES[bgMode] === "auto" && !paused && secRms >= 0) {
                     var swAge = now - lastAutoSwitchAt;
-                    var ratio = (emaFast - emaSlow) / Math.max(emaSlow, 0.01);
-                    if ((swAge > 8000 && (ratio > 0.4 || ratio < -0.3)) || swAge > 30000) {
+                    var dRms = Math.abs(secRms - secBaseRms) / Math.max(secBaseRms, 0.05);
+                    var dZcr = Math.abs(secZcr - secBaseZcr);
+                    var sectionChanged = (dRms > 0.45 || dZcr > 0.14);
+                    if ((swAge > 5000 && sectionChanged) || swAge > 24000) {
                         lastAutoSwitchAt = now;
-                        autoIdx = (autoIdx + 1) % AUTO_EFFECTS.length;
+                        secBaseRms = secRms; secBaseZcr = secZcr;   // reset the section baseline
+                        // Random next effect (no immediate repeat) so all of them
+                        // -- equalizer included -- come up evenly, not just the
+                        // first few in a sequential 2-minute track.
+                        var prevA = autoIdx;
+                        do { autoIdx = Math.floor(Math.random() * AUTO_EFFECTS.length); }
+                        while (autoIdx === prevA && AUTO_EFFECTS.length > 1);
                         spriteMode = (spriteMode + 1) % SPRITE_MODES.length;   // vary avatar physics too
                         wipeActive = false;
                         rings = [];
