@@ -85,15 +85,80 @@ var FLUifcShim;
         console.write(gotoRC(top + 1 + rows, left) + "\xC8" + rep("\xCD", cols - 2) + "\xBC" + sgr("0"));
         return { top: top + 1, left: left + 2, rows: rows, cols: inner };
     }
-    // Read one normalized key via the shared reader (handles cooked cursor codes
-    // AND raw CSI/SS3 arrow sequences -- the same way future_shell does).
+    // Map any arrow representation (cooked byte / raw CSI "[A" / raw SS3 "OA")
+    // to the cursor code the menu handles; other keys pass through first char.
+    function normKey(k) {
+        if (!k || !k.length)
+            return "";
+        if (k.charAt(0) === "\x1b" && k.length >= 2) {
+            var s = k.substr(1);
+            if (s === "[A" || s === "OA")
+                return "\x1e"; // up
+            if (s === "[B" || s === "OB")
+                return "\x0a"; // down
+            if (s === "[C" || s === "OC")
+                return "\x06"; // right
+            if (s === "[D" || s === "OD")
+                return "\x1d"; // left
+            if (s === "[H" || s === "OH" || s === "[1~" || s === "[7~")
+                return "\x02"; // home
+            if (s === "[F" || s === "OF" || s === "[4~" || s === "[8~")
+                return "\x05"; // end
+            if (s === "[5~")
+                return "\x10"; // pgup
+            if (s === "[6~")
+                return "\x0e"; // pgdn
+            return ""; // unknown escape sequence -> ignore
+        }
+        return k.charAt(0);
+    }
+    // Self-contained key read (NO dependency on the FLPlayer namespace -- this
+    // shim lives in the persistent global uifc, so it must not close over any
+    // per-launch scope). console.inkey delivers an arrow byte-by-byte, so on
+    // ESC we assemble the CSI/SS3 sequence before deciding. K_NOECHO|K_NOSPIN
+    // like future_shell.
     function waitKey() {
+        var mode = (typeof K_NOECHO !== "undefined" ? K_NOECHO : 0) |
+            (typeof K_NOSPIN !== "undefined" ? K_NOSPIN : 0);
         for (;;) {
             if (!bbs.online || js.terminated)
                 return ESC;
-            var k = FLPlayer.readKey(200);
-            if (k.length)
-                return k;
+            var k = console.inkey(mode, 200);
+            if (typeof k !== "string" || !k.length)
+                continue;
+            if (k.length > 1) {
+                var nWhole = normKey(k);
+                if (nWhole)
+                    return nWhole;
+                continue;
+            }
+            if (k !== "\x1b")
+                return k; // cooked cursor code or plain key
+            var seq = "";
+            for (var i = 0; i < 8; i += 1) {
+                var c = console.inkey(mode, 60);
+                if (typeof c !== "string" || !c.length)
+                    break;
+                seq += c;
+                if (seq.charAt(0) !== "[" && seq.charAt(0) !== "O")
+                    break;
+                if (seq.charAt(0) === "O") {
+                    if (seq.length >= 2)
+                        break;
+                    else
+                        continue;
+                }
+                if (seq.length >= 2) {
+                    var last = seq.charAt(seq.length - 1);
+                    if (last >= "@" && last <= "~" && !(last >= "0" && last <= "9") && last !== ";")
+                        break;
+                }
+            }
+            if (!seq.length)
+                return "\x1b"; // lone Esc
+            var nSeq = normKey("\x1b" + seq);
+            if (nSeq)
+                return nSeq; // else unknown -> keep waiting
         }
     }
     // ---- the shim object ----------------------------------------------------
@@ -258,7 +323,11 @@ var FLUifcShim;
     shim.list = shimList;
     shimList.CTX = CTX;
     // Install only where the real uifc is absent (in-process door runs).
-    if (typeof uifc === "undefined") {
+    // Install in-process. Reinstall when a STALE shim from a prior door launch
+    // is still sitting in the persistent global uifc (its closures point at a
+    // dead scope) -- but never clobber the real uifc (jsexec), which has no
+    // FLSHIM marker.
+    if (typeof uifc === "undefined" || (uifc && uifc.FLSHIM)) {
         js.global.uifc = shim;
     }
 })(FLUifcShim || (FLUifcShim = {}));
