@@ -85,57 +85,16 @@ var FLUifcShim;
         console.write(gotoRC(top + 1 + rows, left) + "\xC8" + rep("\xCD", cols - 2) + "\xBC" + sgr("0"));
         return { top: top + 1, left: left + 2, rows: rows, cols: inner };
     }
-    function shimDbg(msg) {
-        try {
-            if (typeof FLPlayer !== "undefined" && FLPlayer.dbg)
-                FLPlayer.dbg("shim: " + msg);
-        }
-        catch (_e) { }
-    }
-    // Read one key. Synchronet may deliver a cursor key already cooked (a single
-    // control byte like \x0a) OR as a raw ESC sequence read byte-by-byte -- in
-    // which case a lone \x1b would otherwise read as Esc and close the menu. So
-    // when we see \x1b we pull the follow-up bytes ourselves and decode the
-    // arrow, mapping it to the cursor code the menu already handles. Uses a
-    // fresh getkey/inkey (no shared pump state that could leak an Esc in).
+    // Read one normalized key via the shared reader (handles cooked cursor codes
+    // AND raw CSI/SS3 arrow sequences -- the same way future_shell does).
     function waitKey() {
-        var k = String(console.getkey(K_NONE) || "");
-        if (k !== "\x1b") {
-            shimDbg("getkey=" + JSON.stringify(k));
-            return k; // normal or cooked cursor key
+        for (;;) {
+            if (!bbs.online || js.terminated)
+                return ESC;
+            var k = FLPlayer.readKey(200);
+            if (k.length)
+                return k;
         }
-        var b1 = String(console.inkey(K_NONE, 80) || "");
-        if (b1 !== "[" && b1 !== "O") { // lone Esc (or unknown)
-            shimDbg("ESC (b1=" + JSON.stringify(b1) + ")");
-            return ESC;
-        }
-        var b2 = String(console.inkey(K_NONE, 80) || "");
-        shimDbg("ESC seq " + JSON.stringify(b1) + JSON.stringify(b2));
-        if (b2 === "A")
-            return "\x1e"; // up
-        if (b2 === "B")
-            return "\x0a"; // down
-        if (b2 === "H")
-            return "\x02"; // home
-        if (b2 === "F")
-            return "\x03"; // end (shim uses \x03)
-        if (b2 === "1" || b2 === "7") {
-            console.inkey(K_NONE, 40);
-            return "\x02";
-        } // home (ESC[1~/7~)
-        if (b2 === "4" || b2 === "8") {
-            console.inkey(K_NONE, 40);
-            return "\x03";
-        } // end  (ESC[4~/8~)
-        if (b2 === "5") {
-            console.inkey(K_NONE, 40);
-            return "\x10";
-        } // pgup (ESC[5~)
-        if (b2 === "6") {
-            console.inkey(K_NONE, 40);
-            return "\x0e";
-        } // pgdn (ESC[6~)
-        return ""; // left/right/other -> ignore (no close)
     }
     // ---- the shim object ----------------------------------------------------
     function CTX() {
@@ -200,7 +159,7 @@ var FLUifcShim;
             else if (k === "\x02") { // home
                 cur = 0;
             }
-            else if (k === "\x03") { // end
+            else if (k === "\x05" || k === "\x03") { // end (KEY_END)
                 cur = options.length - 1;
             }
             else if (k === "\r" || k === "\n") {
@@ -1608,6 +1567,57 @@ var FLPlayer;
         return sharedPump.pump(maxMs);
     }
     FLPlayer.pumpShared = pumpShared;
+    // Read and normalize ONE key the proven in-process way (as future_shell
+    // does). console.inkey returns a cursor key EITHER as a cooked control byte
+    // OR as a whole ESC sequence -- CSI ("[A"/"[B") or SS3 ("OA"/"OB"). We map
+    // every representation to the single cursor control code so callers match
+    // one value. "" on timeout. K_NOECHO|K_NOSPIN so the wait neither echoes the
+    // key nor spins a cursor (the mode the shell uses). This is for menus/browse
+    // that have no live audio; the player still uses the pump (it must interleave
+    // APC audio replies with keystrokes).
+    // Normalize one raw inkey value to a single cursor code / plain key. Maps
+    // every arrow representation Synchronet may deliver -- cooked control byte,
+    // raw CSI ("[A"), raw SS3 ("OA") -- to the cursor code. Pure, so it's tested.
+    function normalizeKey(k) {
+        if (!k || !k.length)
+            return "";
+        if (k.charAt(0) === "\x1b" && k.length >= 2) {
+            var seq = k.substr(1);
+            if (seq === "[A" || seq === "OA")
+                return "\x1e"; // up
+            if (seq === "[B" || seq === "OB")
+                return "\x0a"; // down
+            if (seq === "[C" || seq === "OC")
+                return "\x06"; // right
+            if (seq === "[D" || seq === "OD")
+                return "\x1d"; // left
+            if (seq === "[H" || seq === "OH" || seq === "[1~" || seq === "[7~")
+                return "\x02"; // home
+            if (seq === "[F" || seq === "OF" || seq === "[4~" || seq === "[8~")
+                return "\x05"; // end
+            if (seq === "[5~")
+                return "\x10"; // page up
+            if (seq === "[6~")
+                return "\x0e"; // page down
+            return ""; // other escape sequence (e.g. an APC reply) -> ignore
+        }
+        return k.charAt(0); // cooked cursor code or a plain key
+    }
+    FLPlayer.normalizeKey = normalizeKey;
+    function readKey(ms) {
+        var k = console.inkey(K_NOECHO | K_NOSPIN, ms);
+        if (typeof k !== "string" || !k.length)
+            return "";
+        if (k === "\x1b") { // a sequence may have split: grab the rest
+            var more = console.inkey(K_NOECHO | K_NOSPIN, 30);
+            if (typeof more === "string" && more.length)
+                k += more;
+            if (k === "\x1b")
+                return "\x1b"; // truly a lone Esc
+        }
+        return normalizeKey(k);
+    }
+    FLPlayer.readKey = readKey;
     // ---- sink detection ---------------------------------------------------
     /**
      * Two-stage probe:
@@ -2961,6 +2971,20 @@ var FLPlayer;
         var av = FLAnsiGrid.renderBin(bin, 10, 6);
         if (!av || av.height !== 6 || (av.rows[0][0] & 0xff) !== 65)
             throw new Error("renderBin failed");
+        // Key normalization: every arrow representation -> the cursor code.
+        var nk = [
+            ["\x1b[A", "\x1e"], ["\x1bOA", "\x1e"], ["\x1e", "\x1e"], // up
+            ["\x1b[B", "\x0a"], ["\x1bOB", "\x0a"], ["\x0a", "\x0a"], // down
+            ["\x1b[5~", "\x10"], ["\x1b[6~", "\x0e"], // pgup/pgdn
+            ["\x1b[H", "\x02"], ["\x1b[F", "\x05"], // home/end
+            ["\x1b", "\x1b"], ["\r", "\r"], ["a", "a"], [" ", " "], // esc/enter/letter/space
+            ["\x1b[=7;2;0n", ""] // APC reply -> ignored
+        ];
+        for (var nki = 0; nki < nk.length; nki++) {
+            if (normalizeKey(nk[nki][0]) !== nk[nki][1])
+                throw new Error("normalizeKey " + JSON.stringify(nk[nki][0]) + " -> " +
+                    JSON.stringify(normalizeKey(nk[nki][0])) + " want " + JSON.stringify(nk[nki][1]));
+        }
         // Avatar flash rotation: BLACK (fg 0) pinned, LIGHTGRAY (fg 7) moves.
         var fg = { width: 2, height: 1, rows: [[(0x00 << 8) | 0x41, (0x07 << 8) | 0x42]] };
         var fs = FLAnsiGrid.emitFlash(fg, 1, 1, 0, 1, 0, 2, 5);
@@ -5007,34 +5031,32 @@ var FLPlayer;
                     }
                     dirty = false;
                 }
-                var ev = FLPlayer.pumpShared(120);
-                if (ev.esc || ev.keys.length || ev.arrows.length)
-                    dirty = true;
-                for (var ki = 0; ki < ev.keys.length; ki += 1) {
-                    if (ev.keys[ki] === "\r")
-                        grabbed = (grabbed === sel) ? -1 : sel;
-                }
-                for (var ai = 0; ai < ev.arrows.length; ai += 1) {
-                    var d = ev.arrows[ai];
-                    var dir = (d === "up") ? -1 : (d === "down") ? 1 : 0;
-                    if (!dir)
-                        continue;
-                    if (grabbed >= 0) {
-                        var ni = grabbed + dir;
-                        if (ni >= 0 && ni < tracks.length) {
-                            var tmp = tracks[grabbed];
-                            tracks[grabbed] = tracks[ni];
-                            tracks[ni] = tmp;
-                            grabbed = ni;
-                            sel = ni;
-                        }
-                    }
-                    else {
-                        sel = Math.max(0, Math.min(tracks.length - 1, sel + dir));
+                var k = FLPlayer.readKey(120);
+                if (!k.length)
+                    continue;
+                dirty = true;
+                if (k === "\x1b")
+                    break; // Esc: save & exit
+                if (k === "\r") {
+                    grabbed = (grabbed === sel) ? -1 : sel;
+                    continue;
+                } // grab/drop
+                var dir = (k === "\x1e") ? -1 : (k === "\x0a") ? 1 : 0; // up / down
+                if (!dir)
+                    continue;
+                if (grabbed >= 0) {
+                    var ni = grabbed + dir;
+                    if (ni >= 0 && ni < tracks.length) {
+                        var tmp = tracks[grabbed];
+                        tracks[grabbed] = tracks[ni];
+                        tracks[ni] = tmp;
+                        grabbed = ni;
+                        sel = ni;
                     }
                 }
-                if (ev.esc)
-                    break;
+                else {
+                    sel = Math.max(0, Math.min(tracks.length - 1, sel + dir));
+                }
             }
             console.write("\x1b[?25h" + CSI_RESET);
             plSetOrder(name, tracks);
@@ -5165,24 +5187,20 @@ var FLPlayer;
                     }
                     dirty = false;
                 }
-                var ev = FLPlayer.pumpShared(120);
-                if (ev.esc || ev.keys.length || ev.arrows.length || ev.other.length)
-                    FLPlayer.dbg("browse pump: esc=" + ev.esc + " arrows=[" + ev.arrows.join(",") +
-                        "] keys=" + JSON.stringify(ev.keys) + " other=" + JSON.stringify(ev.other));
-                if (ev.esc || ev.keys.length || ev.arrows.length)
+                // One normalized key per read (arrows come back as cursor codes).
+                var k = FLPlayer.readKey(120);
+                if (k.length) {
                     dirty = true;
-                if (ev.esc) {
-                    if (search.length) {
-                        search = "";
-                        sel = 0;
-                        recompute();
+                    if (k === "\x1b") { // Esc: clear the search, else back out
+                        if (search.length) {
+                            search = "";
+                            sel = 0;
+                            recompute();
+                        }
+                        else
+                            done = true;
                     }
-                    else
-                        done = true;
-                }
-                for (var ki = 0; ki < ev.keys.length && !done; ki += 1) {
-                    var k = ev.keys[ki];
-                    if (k === " ") { // SPACE plays the highlighted song
+                    else if (k === " ") { // SPACE plays the highlighted song
                         if (filtered.length) {
                             result = { list: filtered, index: sel };
                             done = true;
@@ -5203,33 +5221,36 @@ var FLPlayer;
                         else
                             full = true;
                     }
-                    else if (k === "\x08" || k === "\x7f") {
+                    else if (k === "\x08" || k === "\x7f") { // Backspace deletes a search char
                         if (search.length) {
                             search = search.substring(0, search.length - 1);
                             sel = 0;
                             recompute();
                         }
                     }
-                    else if (k.length === 1 && k > " " && k <= "~") { // letters filter (space is play)
+                    else if (k === "\x1e") { // up
+                        sel = sel > 0 ? sel - 1 : Math.max(0, filtered.length - 1);
+                    }
+                    else if (k === "\x0a") { // down
+                        sel = filtered.length ? (sel + 1) % filtered.length : 0;
+                    }
+                    else if (k === "\x10" || k === "\x1d") { // page up / left
+                        sel = Math.max(0, sel - listH);
+                    }
+                    else if (k === "\x0e" || k === "\x06") { // page down / right
+                        sel = Math.min(Math.max(0, filtered.length - 1), sel + listH);
+                    }
+                    else if (k === "\x02") { // home
+                        sel = 0;
+                    }
+                    else if (k === "\x05") { // end
+                        sel = Math.max(0, filtered.length - 1);
+                    }
+                    else if (k.length === 1 && k > " " && k <= "~") { // printable -> search (space is play)
                         search += k.toLowerCase();
                         sel = 0;
                         recompute();
                     }
-                }
-                for (var ai = 0; ai < ev.arrows.length; ai += 1) {
-                    var d = ev.arrows[ai];
-                    if (d === "up")
-                        sel = sel > 0 ? sel - 1 : Math.max(0, filtered.length - 1);
-                    else if (d === "down")
-                        sel = filtered.length ? (sel + 1) % filtered.length : 0;
-                    else if (d === "pgup" || d === "left")
-                        sel = Math.max(0, sel - listH);
-                    else if (d === "pgdn" || d === "right")
-                        sel = Math.min(Math.max(0, filtered.length - 1), sel + listH);
-                    else if (d === "home")
-                        sel = 0;
-                    else if (d === "end")
-                        sel = Math.max(0, filtered.length - 1);
                 }
             }
             console.write("\x1b[?25h" + CSI_RESET);
@@ -6103,8 +6124,6 @@ var FLPlayer;
         }
         var app = createAppState();
         activeApp = app;
-        FLPlayer.dbg("startup: uifc type=" + (typeof uifc) +
-            " FLSHIM=" + (typeof uifc !== "undefined" && uifc ? !!uifc.FLSHIM : "n/a"));
         try {
             app.catalog = loadCatalog(false);
             app.cowriters = loadCowriters();

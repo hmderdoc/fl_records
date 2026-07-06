@@ -1848,26 +1848,22 @@ interface AppState {
                     }
                     dirty = false;
                 }
-                var ev = FLPlayer.pumpShared(120);
-                if (ev.esc || ev.keys.length || ev.arrows.length) dirty = true;
-                for (var ki = 0; ki < ev.keys.length; ki += 1) {
-                    if (ev.keys[ki] === "\r") grabbed = (grabbed === sel) ? -1 : sel;
-                }
-                for (var ai = 0; ai < ev.arrows.length; ai += 1) {
-                    var d = ev.arrows[ai];
-                    var dir = (d === "up") ? -1 : (d === "down") ? 1 : 0;
-                    if (!dir) continue;
-                    if (grabbed >= 0) {
-                        var ni = grabbed + dir;
-                        if (ni >= 0 && ni < tracks.length) {
-                            var tmp = tracks[grabbed]; tracks[grabbed] = tracks[ni]; tracks[ni] = tmp;
-                            grabbed = ni; sel = ni;
-                        }
-                    } else {
-                        sel = Math.max(0, Math.min(tracks.length - 1, sel + dir));
+                var k = FLPlayer.readKey(120);
+                if (!k.length) continue;
+                dirty = true;
+                if (k === "\x1b") break;                          // Esc: save & exit
+                if (k === "\r") { grabbed = (grabbed === sel) ? -1 : sel; continue; }  // grab/drop
+                var dir = (k === "\x1e") ? -1 : (k === "\x0a") ? 1 : 0;  // up / down
+                if (!dir) continue;
+                if (grabbed >= 0) {
+                    var ni = grabbed + dir;
+                    if (ni >= 0 && ni < tracks.length) {
+                        var tmp = tracks[grabbed]; tracks[grabbed] = tracks[ni]; tracks[ni] = tmp;
+                        grabbed = ni; sel = ni;
                     }
+                } else {
+                    sel = Math.max(0, Math.min(tracks.length - 1, sel + dir));
                 }
-                if (ev.esc) break;
             }
             console.write("\x1b[?25h" + CSI_RESET);
             plSetOrder(name, tracks);
@@ -1979,42 +1975,41 @@ interface AppState {
                     dirty = false;
                 }
 
-                var ev = FLPlayer.pumpShared(120);
-                if (ev.esc || ev.keys.length || ev.arrows.length || ev.other.length)
-                    FLPlayer.dbg("browse pump: esc=" + ev.esc + " arrows=[" + ev.arrows.join(",") +
-                        "] keys=" + JSON.stringify(ev.keys) + " other=" + JSON.stringify(ev.other));
-                if (ev.esc || ev.keys.length || ev.arrows.length) dirty = true;
-                if (ev.esc) {
-                    if (search.length) { search = ""; sel = 0; recompute(); }
-                    else done = true;
-                }
-                for (var ki = 0; ki < ev.keys.length && !done; ki += 1) {
-                    var k = ev.keys[ki];
-                    if (k === " ") {                    // SPACE plays the highlighted song
+                // One normalized key per read (arrows come back as cursor codes).
+                var k = FLPlayer.readKey(120);
+                if (k.length) {
+                    dirty = true;
+                    if (k === "\x1b") {                          // Esc: clear the search, else back out
+                        if (search.length) { search = ""; sel = 0; recompute(); }
+                        else done = true;
+                    } else if (k === " ") {                      // SPACE plays the highlighted song
                         if (filtered.length) { result = { list: filtered, index: sel }; done = true; }
-                    } else if (k === "\r") {            // ENTER adds it to a playlist
+                    } else if (k === "\r") {                     // ENTER adds it to a playlist
                         if (filtered.length) {
                             addToPlaylistFlow(filtered[sel].name, displayTrackTitle(filtered[sel]));
                             full = true;
                         }
-                    } else if (k === "\t") {            // TAB opens the Playlist Manager
+                    } else if (k === "\t") {                     // TAB opens the Playlist Manager
                         var pm = playlistManager();
                         if (pm) { result = { list: pm.list, index: pm.index, playlist: pm.playlist }; done = true; }
                         else full = true;
-                    } else if (k === "\x08" || k === "\x7f") {
+                    } else if (k === "\x08" || k === "\x7f") {   // Backspace deletes a search char
                         if (search.length) { search = search.substring(0, search.length - 1); sel = 0; recompute(); }
-                    } else if (k.length === 1 && k > " " && k <= "~") {   // letters filter (space is play)
+                    } else if (k === "\x1e") {                   // up
+                        sel = sel > 0 ? sel - 1 : Math.max(0, filtered.length - 1);
+                    } else if (k === "\x0a") {                   // down
+                        sel = filtered.length ? (sel + 1) % filtered.length : 0;
+                    } else if (k === "\x10" || k === "\x1d") {   // page up / left
+                        sel = Math.max(0, sel - listH);
+                    } else if (k === "\x0e" || k === "\x06") {   // page down / right
+                        sel = Math.min(Math.max(0, filtered.length - 1), sel + listH);
+                    } else if (k === "\x02") {                   // home
+                        sel = 0;
+                    } else if (k === "\x05") {                   // end
+                        sel = Math.max(0, filtered.length - 1);
+                    } else if (k.length === 1 && k > " " && k <= "~") {   // printable -> search (space is play)
                         search += k.toLowerCase(); sel = 0; recompute();
                     }
-                }
-                for (var ai = 0; ai < ev.arrows.length; ai += 1) {
-                    var d = ev.arrows[ai];
-                    if (d === "up") sel = sel > 0 ? sel - 1 : Math.max(0, filtered.length - 1);
-                    else if (d === "down") sel = filtered.length ? (sel + 1) % filtered.length : 0;
-                    else if (d === "pgup" || d === "left") sel = Math.max(0, sel - listH);
-                    else if (d === "pgdn" || d === "right") sel = Math.min(Math.max(0, filtered.length - 1), sel + listH);
-                    else if (d === "home") sel = 0;
-                    else if (d === "end") sel = Math.max(0, filtered.length - 1);
                 }
             }
             console.write("\x1b[?25h" + CSI_RESET);
@@ -2830,8 +2825,6 @@ interface AppState {
         }
         var app = createAppState();
         activeApp = app;
-        FLPlayer.dbg("startup: uifc type=" + (typeof uifc) +
-            " FLSHIM=" + (typeof uifc !== "undefined" && uifc ? !!(uifc as any).FLSHIM : "n/a"));
         try {
             app.catalog = loadCatalog(false);
             app.cowriters = loadCowriters();

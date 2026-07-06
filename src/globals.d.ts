@@ -199,6 +199,8 @@ declare var K_LINE: number;
 declare var K_NUMBER: number;
 declare var K_UPPER: number;
 declare var K_NONE: number;
+declare var K_NOECHO: number;
+declare var K_NOSPIN: number;
 declare var USER_ANSI: number;
 declare var USER_UTF8: number;
 declare var MSG_DELETE: number;

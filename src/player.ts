@@ -458,6 +458,45 @@ namespace FLPlayer {
         return sharedPump.pump(maxMs);
     }
 
+    // Read and normalize ONE key the proven in-process way (as future_shell
+    // does). console.inkey returns a cursor key EITHER as a cooked control byte
+    // OR as a whole ESC sequence -- CSI ("[A"/"[B") or SS3 ("OA"/"OB"). We map
+    // every representation to the single cursor control code so callers match
+    // one value. "" on timeout. K_NOECHO|K_NOSPIN so the wait neither echoes the
+    // key nor spins a cursor (the mode the shell uses). This is for menus/browse
+    // that have no live audio; the player still uses the pump (it must interleave
+    // APC audio replies with keystrokes).
+    // Normalize one raw inkey value to a single cursor code / plain key. Maps
+    // every arrow representation Synchronet may deliver -- cooked control byte,
+    // raw CSI ("[A"), raw SS3 ("OA") -- to the cursor code. Pure, so it's tested.
+    export function normalizeKey(k: string): string {
+        if (!k || !k.length) return "";
+        if (k.charAt(0) === "\x1b" && k.length >= 2) {
+            var seq = k.substr(1);
+            if (seq === "[A" || seq === "OA") return "\x1e";                              // up
+            if (seq === "[B" || seq === "OB") return "\x0a";                              // down
+            if (seq === "[C" || seq === "OC") return "\x06";                              // right
+            if (seq === "[D" || seq === "OD") return "\x1d";                              // left
+            if (seq === "[H" || seq === "OH" || seq === "[1~" || seq === "[7~") return "\x02"; // home
+            if (seq === "[F" || seq === "OF" || seq === "[4~" || seq === "[8~") return "\x05"; // end
+            if (seq === "[5~") return "\x10";                                             // page up
+            if (seq === "[6~") return "\x0e";                                             // page down
+            return "";                       // other escape sequence (e.g. an APC reply) -> ignore
+        }
+        return k.charAt(0);                  // cooked cursor code or a plain key
+    }
+
+    export function readKey(ms: number): string {
+        var k = console.inkey(K_NOECHO | K_NOSPIN, ms);
+        if (typeof k !== "string" || !k.length) return "";
+        if (k === "\x1b") {                 // a sequence may have split: grab the rest
+            var more = console.inkey(K_NOECHO | K_NOSPIN, 30);
+            if (typeof more === "string" && more.length) k += more;
+            if (k === "\x1b") return "\x1b"; // truly a lone Esc
+        }
+        return normalizeKey(k);
+    }
+
     // ---- sink detection ---------------------------------------------------
     /**
      * Two-stage probe:
@@ -1879,6 +1918,21 @@ namespace FLPlayer {
         var av = FLAnsiGrid.renderBin(bin, 10, 6);
         if (!av || av.height !== 6 || (av.rows[0][0] & 0xff) !== 65)
             throw new Error("renderBin failed");
+
+        // Key normalization: every arrow representation -> the cursor code.
+        var nk: [string, string][] = [
+            ["\x1b[A", "\x1e"], ["\x1bOA", "\x1e"], ["\x1e", "\x1e"],   // up
+            ["\x1b[B", "\x0a"], ["\x1bOB", "\x0a"], ["\x0a", "\x0a"],   // down
+            ["\x1b[5~", "\x10"], ["\x1b[6~", "\x0e"],                   // pgup/pgdn
+            ["\x1b[H", "\x02"], ["\x1b[F", "\x05"],                     // home/end
+            ["\x1b", "\x1b"], ["\r", "\r"], ["a", "a"], [" ", " "],     // esc/enter/letter/space
+            ["\x1b[=7;2;0n", ""]                                        // APC reply -> ignored
+        ];
+        for (var nki = 0; nki < nk.length; nki++) {
+            if (normalizeKey(nk[nki][0]) !== nk[nki][1])
+                throw new Error("normalizeKey " + JSON.stringify(nk[nki][0]) + " -> " +
+                    JSON.stringify(normalizeKey(nk[nki][0])) + " want " + JSON.stringify(nk[nki][1]));
+        }
 
         // Avatar flash rotation: BLACK (fg 0) pinned, LIGHTGRAY (fg 7) moves.
         var fg: any = { width: 2, height: 1, rows: [[(0x00 << 8) | 0x41, (0x07 << 8) | 0x42]] };

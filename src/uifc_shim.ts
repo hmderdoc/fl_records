@@ -90,38 +90,14 @@ namespace FLUifcShim {
         return { top: top + 1, left: left + 2, rows: rows, cols: inner };
     }
 
-    function shimDbg(msg: string): void {
-        try { if (typeof FLPlayer !== "undefined" && FLPlayer.dbg) FLPlayer.dbg("shim: " + msg); } catch (_e) { }
-    }
-
-    // Read one key. Synchronet may deliver a cursor key already cooked (a single
-    // control byte like \x0a) OR as a raw ESC sequence read byte-by-byte -- in
-    // which case a lone \x1b would otherwise read as Esc and close the menu. So
-    // when we see \x1b we pull the follow-up bytes ourselves and decode the
-    // arrow, mapping it to the cursor code the menu already handles. Uses a
-    // fresh getkey/inkey (no shared pump state that could leak an Esc in).
+    // Read one normalized key via the shared reader (handles cooked cursor codes
+    // AND raw CSI/SS3 arrow sequences -- the same way future_shell does).
     function waitKey(): string {
-        var k = String(console.getkey(K_NONE) || "");
-        if (k !== "\x1b") {
-            shimDbg("getkey=" + JSON.stringify(k));
-            return k;                                   // normal or cooked cursor key
+        for (; ;) {
+            if (!bbs.online || js.terminated) return ESC;
+            var k = FLPlayer.readKey(200);
+            if (k.length) return k;
         }
-        var b1 = String(console.inkey(K_NONE, 80) || "");
-        if (b1 !== "[" && b1 !== "O") {                 // lone Esc (or unknown)
-            shimDbg("ESC (b1=" + JSON.stringify(b1) + ")");
-            return ESC;
-        }
-        var b2 = String(console.inkey(K_NONE, 80) || "");
-        shimDbg("ESC seq " + JSON.stringify(b1) + JSON.stringify(b2));
-        if (b2 === "A") return "\x1e";                  // up
-        if (b2 === "B") return "\x0a";                  // down
-        if (b2 === "H") return "\x02";                  // home
-        if (b2 === "F") return "\x03";                  // end (shim uses \x03)
-        if (b2 === "1" || b2 === "7") { console.inkey(K_NONE, 40); return "\x02"; }   // home (ESC[1~/7~)
-        if (b2 === "4" || b2 === "8") { console.inkey(K_NONE, 40); return "\x03"; }   // end  (ESC[4~/8~)
-        if (b2 === "5") { console.inkey(K_NONE, 40); return "\x10"; }                 // pgup (ESC[5~)
-        if (b2 === "6") { console.inkey(K_NONE, 40); return "\x0e"; }                 // pgdn (ESC[6~)
-        return "";                                      // left/right/other -> ignore (no close)
     }
 
     // ---- the shim object ----------------------------------------------------
@@ -188,7 +164,7 @@ namespace FLUifcShim {
                 cur = Math.min(options.length - 1, cur + visible);
             } else if (k === "\x02") {                    // home
                 cur = 0;
-            } else if (k === "\x03") {                    // end
+            } else if (k === "\x05" || k === "\x03") {    // end (KEY_END)
                 cur = options.length - 1;
             } else if (k === "\r" || k === "\n") {
                 if (ctx) ctx.cur = cur;
