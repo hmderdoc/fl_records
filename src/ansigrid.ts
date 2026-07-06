@@ -308,6 +308,35 @@ namespace FLAnsiGrid {
         return out + "\x1b[0m";
     }
 
+    /** emit(), but the palette index is chosen PER CELL by palFor(screenX,
+     *  screenY) -- lets a caller sweep one palette in over another (a spatial
+     *  "fill" transition) instead of recolouring the whole art at once. */
+    export function emitWipe(grid: Grid, left: number, top: number,
+        srcRow: number, nRows: number, srcCol: number, nCols: number,
+        palFor: (screenX: number, screenY: number) => number): string {
+        var out = "";
+        var lastSgr = "";
+        for (var r = 0; r < nRows; r++) {
+            var gy = srcRow + r;
+            if (gy < 0 || gy >= grid.rows.length)
+                continue;
+            var row = grid.rows[gy];
+            var sy = top + r;
+            out += "\x1b[" + sy + ";" + left + "H";
+            for (var cIdx = 0; cIdx < nCols; cIdx++) {
+                var gx = srcCol + cIdx;
+                var cell = gx >= 0 && gx < row.length ? row[gx] : ((DEFAULT_ATTR << 8) | 0x20);
+                var code = attrToSgr(cell >> 8, palFor(left + cIdx, sy));
+                if (code !== lastSgr) {
+                    out += "\x1b[" + code + "m";
+                    lastSgr = code;
+                }
+                out += String.fromCharCode(cell & 0xff);
+            }
+        }
+        return out + "\x1b[0m";
+    }
+
     /**
      * Blit a window of the grid to the screen: source rows [srcRow, srcRow+nRows)
      * and cols [srcCol, srcCol+nCols) drawn with the top-left at screen

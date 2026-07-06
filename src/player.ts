@@ -741,6 +741,23 @@ namespace FLPlayer {
             blit.srcRow, blit.nRows, blit.srcCol, blit.nCols, blit.pal));
     }
 
+    /** Recolour the whole art by a full 16-colour rotation (BLACK pinned) --
+     *  quick all-at-once cycles, like the avatar flash. */
+    function drawArtFlash(blit: ArtBlit, rot: number): void {
+        if (!blit.grid)
+            return;
+        console.write(FLAnsiGrid.emitFlash(blit.grid, blit.left, blit.top,
+            blit.srcRow, blit.nRows, blit.srcCol, blit.nCols, rot));
+    }
+
+    /** Render the art with a per-cell palette (for a spatial fill transition). */
+    function drawArtWipe(blit: ArtBlit, palFor: (x: number, y: number) => number): void {
+        if (!blit.grid)
+            return;
+        console.write(FLAnsiGrid.emitWipe(blit.grid, blit.left, blit.top,
+            blit.srcRow, blit.nRows, blit.srcCol, blit.nCols, palFor));
+    }
+
     /** Restore the backdrop over a screen rect: art cells where the rect
      *  overlaps the art blit; elsewhere a "wake" — a colored shade (the
      *  sprite's trail) that the next background repaint dissolves. */
@@ -1537,6 +1554,19 @@ namespace FLPlayer {
         var artFlashAt = 0;
         var PALETTE_SEQ: number[] = [];   // chosen once the art grid exists
         var palStep = 0;
+        // Art-swap styles (rotate with the effect): pulse = step the palette on
+        // beats; rotate = quick full-colour cycle bursts; wipe = fill the next
+        // palette in symmetrically (centre-out / edge-in).
+        var ART_SWAP_MODES = ["pulse", "rotate", "wipe"];
+        var artSwapMode = 0;
+        var artRot = 0;                   // rotate: colour-wheel phase
+        var artRotFrames = 0;             // rotate: rapid-cycle frames left after a beat
+        var wipeActive = false;
+        var wipeFront = 0;
+        var wipeMaxR = 1;
+        var wipeOld = 0;
+        var wipeNew = 0;
+        var wipeStyle = 0;                // 0 = centre-out, 1 = edge-in
         var margins: Rect[] = [];
         var checkerPhase = 0;
         var checkerDirty = true;
@@ -1642,6 +1672,7 @@ namespace FLPlayer {
             lyricIdx = -1;      // repaint the lyric row after the redraw
             rings = [];
             stars = []; matrixDrops = []; fireHeat = {};   // positions were screen-relative
+            wipeActive = false;
             redrawAll();
         }
 
@@ -1878,6 +1909,8 @@ namespace FLPlayer {
                         lastAutoSwitchAt = now;
                         autoIdx = (autoIdx + 1) % AUTO_EFFECTS.length;
                         spriteMode = (spriteMode + 1) % SPRITE_MODES.length;   // vary avatar physics too
+                        artSwapMode = (artSwapMode + 1) % ART_SWAP_MODES.length; // and the art-swap style
+                        wipeActive = false;
                         rings = [];
                         checkerDirty = true;
                         strobeLevel = 3;
@@ -1887,13 +1920,56 @@ namespace FLPlayer {
                 // Art color-pulse: on beats, step the palette sequence (a
                 // set of distinct permutation maps that keeps returning to the
                 // true palette; rate-capped so slow links keep breathing room).
-                if (mode === "glow+art" && beat && blit.grid &&
-                    now - artFlashAt > 450) {
-                    artFlashAt = now;
-                    palStep = PALETTE_SEQ.length ? (palStep + 1) % PALETTE_SEQ.length : 0;
-                    blit.pal = PALETTE_SEQ.length ? PALETTE_SEQ[palStep] : 0;
-                    drawArt(blit);
-                    drawSprites(sprites, l, blit, true);
+                if (mode === "glow+art" && blit.grid && !paused) {
+                    var swap = ART_SWAP_MODES[artSwapMode];
+                    if (swap === "rotate") {
+                        // Quick full-colour cycles: a short burst of rotation
+                        // frames on each beat (all colours at once, grays too).
+                        if (beat) artRotFrames = 4;
+                        if (artRotFrames > 0) {
+                            artRot = (artRot + 4 + Math.floor(features.rms * 8)) % 15;
+                            if (artRot === 0) artRot = 1;
+                            drawArtFlash(blit, artRot);
+                            drawSprites(sprites, l, blit, true);
+                            artRotFrames--;
+                            if (artRotFrames === 0) { drawArt(blit); drawSprites(sprites, l, blit, true); }
+                        }
+                    } else if (swap === "wipe") {
+                        // Timed symmetric fill: sweep the next palette in.
+                        if (!wipeActive && beat && now - artFlashAt > 550) {
+                            artFlashAt = now;
+                            wipeActive = true; wipeFront = 0;
+                            wipeOld = blit.pal;
+                            palStep = PALETTE_SEQ.length ? (palStep + 1) % PALETTE_SEQ.length : 0;
+                            wipeNew = PALETTE_SEQ.length ? PALETTE_SEQ[palStep] : 0;
+                            wipeStyle = (wipeStyle + 1) % 2;
+                            var hw = blit.nCols * 0.25, hh = blit.nRows * 0.5;
+                            wipeMaxR = Math.sqrt(hw * hw + hh * hh) * 2 + 3;
+                        }
+                        if (wipeActive) {
+                            wipeFront += wipeMaxR / 9;
+                            var acx = blit.left + blit.nCols / 2;
+                            var acy = blit.top + blit.nRows / 2;
+                            var frontR = wipeFront, oldP = wipeOld, newP = wipeNew;
+                            var edgeIn = wipeStyle === 1, maxR = wipeMaxR;
+                            drawArtWipe(blit, function (x: number, y: number): number {
+                                var dx = (x - acx) * 0.5, dy = y - acy;
+                                var d = Math.sqrt(dx * dx + dy * dy) * 2;
+                                var isNew = edgeIn ? (d >= maxR - frontR) : (d <= frontR);
+                                return isNew ? newP : oldP;
+                            });
+                            drawSprites(sprites, l, blit, true);
+                            if (wipeFront >= wipeMaxR + 2) { wipeActive = false; blit.pal = wipeNew; }
+                        }
+                    } else {   // pulse: step the palette on beats (all at once)
+                        if (beat && now - artFlashAt > 420) {
+                            artFlashAt = now;
+                            palStep = PALETTE_SEQ.length ? (palStep + 1) % PALETTE_SEQ.length : 0;
+                            blit.pal = PALETTE_SEQ.length ? PALETTE_SEQ[palStep] : 0;
+                            drawArt(blit);
+                            drawSprites(sprites, l, blit, true);
+                        }
+                    }
                 }
 
                 // Hint-bar hue cycles on the beat (rate-capped so it pulses with
