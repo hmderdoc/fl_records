@@ -104,6 +104,10 @@ namespace FLPlayer {
     // on -> next track is random from the queue, off -> sequential. Shared here
     // so both the player (toggle/display) and the jukebox loop (advance) see it.
     export var shuffle = false;
+    // Set whenever shuffle is switched ON (any off->on). playInTerminal consumes
+    // it on the next advance to start a BRAND-NEW shuffle from position 1, rather
+    // than resuming the old deck -- so shuffle->off->on gives a fresh shuffle.
+    export var shuffleReset = false;
 
     // ---- small helpers --------------------------------------------------
     function shellQuote(s: string): string {
@@ -1981,6 +1985,7 @@ namespace FLPlayer {
                     quitReq = true;
                 } else if (k === "S") {
                     shuffle = !shuffle;      // toggle track shuffle (indicator on next tick)
+                    if (shuffle) shuffleReset = true;   // entering shuffle -> fresh deck from 1
                 }
             }
             for (var a = 0; a < ev.arrows.length; a++) {
