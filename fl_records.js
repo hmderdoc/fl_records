@@ -5204,7 +5204,12 @@ var FLPlayer;
             var history = []; // played indices, oldest-first: P returns to the REAL previous track
             var bag = []; // shuffle deck: every queue track plays once before any repeats
             seedBag(bag, curList.length, idx); // first cycle excludes the track already playing
-            var shufCount = 1; // 1-based position within the CURRENT shuffle cycle (1..len, then resets)
+            // Position within the current PASS through the queue (1..len), for the
+            // "3/42" indicator. Counts actual advances -- NOT idx+1, because shuffle
+            // scrambles idx to arbitrary positions and idx+1 would then read as a
+            // random high number even after only a few plays. Same meaning in both
+            // modes: how many tracks you've advanced through this pass.
+            var passPos = 1;
             while (bbs.online && !js.terminated) {
                 var cur = curList[idx];
                 // Immediate feedback for the inter-track gap (tag parse +
@@ -5246,9 +5251,7 @@ var FLPlayer;
                     flatLyrics: flat,
                     avatars: trackAvatars(cur),
                     queueName: currentPlaylist, // "" for radio/browse -> no count shown
-                    // Shuffle: position within the cycle (1..len, resets each cycle).
-                    // Sequential: natural track number in the list.
-                    queuePos: FLPlayer.shuffle ? shufCount : (idx + 1),
+                    queuePos: passPos, // position in this pass (same in both modes)
                     queueLen: curList.length
                 };
                 var outcome = FLPlayer.playTrack(playable);
@@ -5285,7 +5288,7 @@ var FLPlayer;
                             FLPlayer.shuffle = false; // play a playlist in its arranged order
                         history = [];
                         seedBag(bag, curList.length, idx);
-                        shufCount = 1; // fresh queue -> fresh cycle
+                        passPos = 1; // fresh queue -> fresh pass
                     }
                     console.clear();
                     continue;
@@ -5305,7 +5308,7 @@ var FLPlayer;
                             idx = 0;
                         history = [];
                         seedBag(bag, curList.length, idx);
-                        shufCount = 1; // indices shifted -> reset nav state
+                        passPos = 1; // indices shifted -> reset nav state
                     }
                     else {
                         console.clear();
@@ -5347,11 +5350,11 @@ var FLPlayer;
                         if (goBack) {
                             if (history.length) {
                                 idx = history.pop();
-                                if (FLPlayer.shuffle && shufCount > 1)
-                                    shufCount -= 1; // step back in the cycle
+                                passPos = passPos > 1 ? passPos - 1 : 1; // step back in the pass
                             }
                             else if (!FLPlayer.shuffle) {
                                 idx = (idx - 1 + curList.length) % curList.length;
+                                passPos = passPos > 1 ? passPos - 1 : 1;
                             }
                             // shuffle with no history yet: stay on the current track
                         }
@@ -5359,16 +5362,17 @@ var FLPlayer;
                             history.push(idx);
                             if (history.length > 500)
                                 history.shift();
-                            if (FLPlayer.shuffle && curList.length > 1) {
-                                // An empty bag means shuffleNext starts a NEW cycle:
-                                // the counter resets to 1; otherwise it advances.
-                                var newCycle = bag.length === 0;
+                            // Advance one track and climb the pass position 1..len.
+                            // It resets to 1 when the shuffle bag empties (all played)
+                            // or when it would pass len (a full pass elapsed). Never
+                            // derived from idx -- shuffle scrambles idx, so idx+1 would
+                            // read as a random high number after only a few plays.
+                            var newPass = FLPlayer.shuffle && curList.length > 1 && bag.length === 0;
+                            if (FLPlayer.shuffle && curList.length > 1)
                                 idx = shuffleNext(curList.length, idx, bag);
-                                shufCount = newCycle ? 1 : shufCount + 1;
-                            }
-                            else {
+                            else
                                 idx = (idx + 1) % curList.length;
-                            }
+                            passPos = (newPass || passPos >= curList.length) ? 1 : passPos + 1;
                         }
                     }
                     FLPlayer.dbg("nav -> idx=" + idx + (FLPlayer.shuffle ? " (shuffle bag=" + bag.length + ")" : ""));
