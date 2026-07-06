@@ -93,6 +93,9 @@ namespace FLPlayer {
         lyrics?: LyricLine[];   // timestamped (SYLT or .lrc); preferred
         flatLyrics?: string;    // untimed fallback, distributed over duration
         avatars?: string[];     // raw 10x6 BIN blobs (decoded), up to 2
+        queueName?: string;     // playlist name when the queue IS a playlist ("" = radio/browse)
+        queuePos?: number;      // 1-based position of this track in the queue
+        queueLen?: number;      // queue length (for the "3/12" indicator)
     }
 
     export type PlayResult = "quit" | "next" | "prev" | "ended" | "error" | "browse" | "create" | "addplaylist" | "removeplaylist";
@@ -874,11 +877,24 @@ namespace FLPlayer {
 
     function drawTitleLine(l: Layout, track: PlayableTrack): void {
         var inner = l.boxWidth - 4;
+        // Right-aligned playlist tag ("MyList 3/12") -- shown ONLY when the queue
+        // is a playlist, so its presence tells you a playlist is loaded (vs radio).
+        var tag = "";
+        if (track.queueName && track.queueLen && track.queueLen > 0) {
+            var nm = track.queueName.length > 16 ? track.queueName.substr(0, 15) + "\xAF" : track.queueName;
+            tag = nm + " " + track.queuePos + "/" + track.queueLen;
+        }
+        var titleRoom = inner;
+        if (tag.length && inner - tag.length - 1 >= 12) titleRoom = inner - tag.length - 1;
+        else tag = "";                       // too narrow -> drop the tag, keep the title
         var label = "\x0e " + track.title + (track.artist.length ? " - " + track.artist : "");
-        if (label.length > inner)
-            label = label.substr(0, inner - 3) + "...";
+        if (label.length > titleRoom)
+            label = label.substr(0, titleRoom - 3) + "...";
+        var pad = inner - label.length - tag.length;
+        if (pad < 0) pad = 0;
         console.write(gotoRC(l.boxTop + 1, l.boxLeft + 2) +
-            sgr("1;36") + label + repeatByte(" ", inner - label.length) + CLR);
+            sgr("1;36") + label + repeatByte(" ", pad) +
+            (tag.length ? sgr("1;35") + tag : "") + CLR);
     }
 
     function drawProgress(l: Layout, playedSec: number, totalSec: number, paused: boolean): void {

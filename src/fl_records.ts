@@ -1430,7 +1430,10 @@ interface AppState {
                     ansiArt: parsed.ansiArtBase64.length ? base64_decode(parsed.ansiArtBase64) : "",
                     lyrics: timed,
                     flatLyrics: flat,
-                    avatars: trackAvatars(cur)
+                    avatars: trackAvatars(cur),
+                    queueName: currentPlaylist,     // "" for radio/browse -> no tag shown
+                    queuePos: idx + 1,
+                    queueLen: curList.length
                 };
                 var outcome = FLPlayer.playTrack(playable);
                 // Honor whatever was pressed while the player was tearing
