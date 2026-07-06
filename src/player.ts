@@ -1350,35 +1350,41 @@ namespace FLPlayer {
         });
     }
 
-    // Graphic equaliser: a bar per column, height driven by loudness with a
-    // per-band oscillation (edges lean on ZCR = "highs", middle on RMS = "lows"),
-    // fast attack / slow decay, and falling peak caps. Bars rise in the art-zone
-    // margins (they frame the art on wide terminals). VU colour ramp.
+    // Cyberpunk graphic equaliser: SEGMENTED neon bars -- 2 columns wide with a
+    // 1-column gap (EQ_PERIOD 3) so they read as distinct bars, not a green
+    // blob. One height per band (low bands lean on RMS = "lows", high bands on
+    // ZCR = "highs") with per-band oscillation, snappy attack / slow decay,
+    // floating peak caps. Neon ramp cyan -> purple -> magenta -> hot red.
+    var EQ_PERIOD = 3;
     function stepEq(bars: number[], peaks: number[], cols: number, rms: number,
         zcr: number, beat: boolean, t: number): void {
-        while (bars.length <= cols) { bars.push(0); peaks.push(0); }
-        for (var x = 1; x <= cols; x++) {
-            var band = Math.abs(x - cols / 2) / Math.max(1, cols / 2);   // 0 centre .. 1 edge
-            var osc = 0.55 + 0.45 * Math.sin(x * 0.7 + t * (2 + band * 3));
-            var target = clamp((rms * (1 - band * 0.45) * 0.75 + zcr * band * 0.7) * osc +
-                (beat ? 0.22 : 0), 0, 1);
-            if (target > bars[x]) bars[x] += (target - bars[x]) * 0.55;   // fast attack
-            else bars[x] += (target - bars[x]) * 0.18;                    // slow decay
-            if (bars[x] > peaks[x]) peaks[x] = bars[x];
-            else peaks[x] = Math.max(bars[x], peaks[x] - 0.025);
+        var n = Math.floor(cols / EQ_PERIOD) + 2;
+        while (bars.length < n) { bars.push(0); peaks.push(0); }
+        for (var i = 0; i < n; i++) {
+            var f = n > 1 ? i / (n - 1) : 0;                       // 0..1 pseudo low->high
+            var osc = 0.45 + 0.55 * Math.sin(i * 0.9 + t * (1.6 + f * 3));
+            var target = clamp((rms * (1.15 - f * 0.7) + zcr * (0.25 + f)) * osc * 1.15 +
+                (beat ? 0.28 : 0), 0, 1);
+            if (target > bars[i]) bars[i] += (target - bars[i]) * 0.6;    // snappy attack
+            else bars[i] += (target - bars[i]) * 0.16;                    // slow decay
+            if (bars[i] > peaks[i]) peaks[i] = bars[i];
+            else peaks[i] = Math.max(bars[i], peaks[i] - 0.028);
         }
     }
     function drawEq(rects: Rect[], bars: number[], peaks: number[], top: number, base: number): void {
         var span = Math.max(1, base - top);
         cellPaint(rects, function (x: number, y: number): string[] | null {
-            var h = bars[x] || 0;
-            var pk = peaks[x] || 0;
+            if ((x - 1) % EQ_PERIOD === EQ_PERIOD - 1) return null;         // gap column
+            var i = Math.floor((x - 1) / EQ_PERIOD);
+            var h = bars[i] || 0;
+            var pk = peaks[i] || 0;
             var py = base - Math.round(pk * span);
             var barTop = base - Math.round(h * span);
-            if (pk > 0.05 && y === py && y <= barTop) return ["1;37", "\xDF"];   // peak cap
+            if (pk > 0.05 && y === py && y <= barTop) return ["1;37", "\xDF"];   // white peak cap
             if (h >= 0.02 && y >= barTop && y <= base) {
-                var frac = (base - y) / span;
-                return [frac > 0.72 ? "1;31" : frac > 0.45 ? "1;33" : "0;32", "\xDB"];
+                var frac = (base - y) / span;                              // 0 bottom .. 1 top
+                var col = frac > 0.78 ? "1;31" : frac > 0.52 ? "1;35" : frac > 0.26 ? "0;35" : "1;36";
+                return [col, "\xDB"];
             }
             return null;
         });
