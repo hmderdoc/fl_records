@@ -2120,7 +2120,7 @@ var FLPlayer;
     // shade/color follow loudness/brightness, with a bright strobe flash
     // decaying over a few frames on hard beats. The lyric line, glow strips,
     // box and hints rows are never touched. [B] cycles auto/checker/strobe/off.
-    var BG_MODES = ["auto", "checker", "plasma", "ripple", "strobe", "off"];
+    var BG_MODES = ["auto", "checker", "plasma", "ripple", "tunnel", "starfield", "matrix", "fire", "strobe", "off"];
     function marginRects(l, blit) {
         var rects = [];
         var zoneTop = l.artTop;
@@ -2285,6 +2285,140 @@ var FLPlayer;
         }
         console.write(out + CLR);
     }
+    // Generic per-cell paint: fn(x,y) -> [sgr, char] | null (null = blank). Sets
+    // bgCellFn so text rides on top, then paints the margin cells. Used by the
+    // sparse effects (starfield, matrix) that place characters, not fill fields.
+    function cellPaint(rects, fn) {
+        bgCellFn = fn;
+        var out = "";
+        for (var r = 0; r < rects.length; r++) {
+            var rc = rects[r];
+            for (var row = 0; row < rc.h; row++) {
+                out += gotoRC(rc.y + row, rc.x);
+                var last = "@";
+                for (var col = 0; col < rc.w; col++) {
+                    var cell = fn(rc.x + col, rc.y + row);
+                    var code = cell ? cell[0] : "0";
+                    var ch = cell ? cell[1] : " ";
+                    if (code !== last) {
+                        out += sgr(code);
+                        last = code;
+                    }
+                    out += ch;
+                }
+            }
+        }
+        console.write(out + CLR);
+    }
+    /** Tunnel: perspective depth rings + angular spokes receding to centre. */
+    function drawTunnel(rects, t, zcr, cx, cy) {
+        fieldPaint(rects, zcr, function (x, y) {
+            var dx = (x - cx) * 0.5; // squash for cell aspect
+            var dy = y - cy;
+            var dist = Math.sqrt(dx * dx + dy * dy) + 0.6;
+            var ang = Math.atan2(dy, dx);
+            return Math.sin(9 / dist + t) * 0.5 + Math.sin(ang * 8 - t * 0.5) * 0.3 + 0.5;
+        });
+    }
+    function spawnStar(cx, cy) {
+        var a = Math.random() * Math.PI * 2;
+        return { x: cx, y: cy, dx: Math.cos(a), dy: Math.sin(a) * 0.5 };
+    }
+    function stepStars(stars, want, cx, cy, cols, rows, top, rms) {
+        while (stars.length < want)
+            stars.push(spawnStar(cx, cy));
+        var speed = 0.4 + rms * 2.4;
+        for (var i = 0; i < stars.length; i++) {
+            var s = stars[i];
+            var d = Math.abs(s.x - cx) + Math.abs(s.y - cy) + 1;
+            s.x += s.dx * speed * (0.4 + d * 0.05);
+            s.y += s.dy * speed * (0.4 + d * 0.05);
+            if (s.x < 1 || s.x > cols || s.y < top || s.y > rows)
+                stars[i] = spawnStar(cx, cy);
+        }
+    }
+    function drawStars(rects, stars, cx, cy) {
+        var map = {};
+        for (var i = 0; i < stars.length; i++) {
+            var sx = Math.round(stars[i].x), sy = Math.round(stars[i].y);
+            var d = Math.abs(sx - cx) * 0.5 + Math.abs(sy - cy);
+            map[sx + "," + sy] = d > 16 ? ["1;37", "*"] : d > 8 ? ["0;37", "+"] : ["1;30", "."];
+        }
+        cellPaint(rects, function (x, y) {
+            return map[x + "," + y] || null;
+        });
+    }
+    var MATRIX_CHARS = "0123456789ABCDEF<>|/\\=+*#%\xB1\xF4\xE0\xEA\xE7\x9E";
+    function stepMatrix(drops, cols, rows, top, rms, beat) {
+        if (drops.length < cols + 8 && (Math.random() < 0.15 + rms * 0.45 || beat))
+            drops.push({
+                col: 1 + Math.floor(Math.random() * cols), head: top,
+                len: 4 + Math.floor(Math.random() * 9), speed: 0.4 + Math.random() * 0.9
+            });
+        for (var i = drops.length - 1; i >= 0; i--) {
+            drops[i].head += drops[i].speed * (0.6 + rms * 1.3);
+            if (drops[i].head - drops[i].len > rows)
+                drops.splice(i, 1);
+        }
+    }
+    function drawMatrix(rects, drops) {
+        var map = {};
+        for (var i = 0; i < drops.length; i++) {
+            var d = drops[i];
+            var h = Math.floor(d.head);
+            for (var t = 0; t < d.len; t++) {
+                var ch = MATRIX_CHARS.charAt(Math.floor(Math.random() * MATRIX_CHARS.length));
+                map[d.col + "," + (h - t)] = [t === 0 ? "1;37" : t < 3 ? "1;32" : "0;32", ch];
+            }
+        }
+        cellPaint(rects, function (x, y) {
+            return map[x + "," + y] || null;
+        });
+    }
+    // Fire: a heat field seeded along the bottom (fuel follows loudness/beats)
+    // that rises and cools -- classic demoscene fire, warm ASCII gradient.
+    var FIRE_CHARS = [" ", "\xB0", "\xB1", "\xB2", "\xB2", "\xDB"];
+    var FIRE_COLORS = ["0", "0;31", "1;31", "1;33", "1;33", "1;37"];
+    function drawFire(rects, heat, cols, rows, top, rms, beat) {
+        // Seed the bottom rows with fuel.
+        var base = rows;
+        for (var x = 1; x <= cols; x++) {
+            var fuel = 0.35 + Math.random() * (0.35 + rms * 0.9) + (beat ? 0.3 : 0);
+            heat[x + "," + base] = Math.min(1, fuel);
+            heat[x + "," + (base - 1)] = Math.min(1, fuel * 0.9);
+        }
+        // Propagate upward with cooling (average of the row below +/- a column).
+        var next = {};
+        for (var y = top; y < base - 1; y++) {
+            for (var cx2 = 1; cx2 <= cols; cx2++) {
+                var below = (heat[cx2 + "," + (y + 1)] || 0) +
+                    (heat[(cx2 - 1) + "," + (y + 1)] || 0) +
+                    (heat[(cx2 + 1) + "," + (y + 1)] || 0) +
+                    (heat[cx2 + "," + (y + 2)] || 0);
+                var v = below / 4 - 0.06;
+                if (v > 0.02)
+                    next[cx2 + "," + y] = v > 1 ? 1 : v;
+            }
+        }
+        next[""] = 0;
+        for (var bx = 1; bx <= cols; bx++) {
+            next[bx + "," + base] = heat[bx + "," + base] || 0;
+            next[bx + "," + (base - 1)] = heat[bx + "," + (base - 1)] || 0;
+        }
+        for (var kk in heat)
+            if (heat.hasOwnProperty(kk))
+                delete heat[kk];
+        for (var k2 in next)
+            if (next.hasOwnProperty(k2))
+                heat[k2] = next[k2];
+        cellPaint(rects, function (x, y) {
+            var hv = heat[x + "," + y];
+            if (!hv)
+                return null;
+            var b = Math.min(FIRE_CHARS.length - 1, Math.floor(hv * FIRE_CHARS.length));
+            return b > 0 ? [FIRE_COLORS[b], FIRE_CHARS[b]] : null;
+        });
+    }
     var TRAIL_COLORS = ["0;35", "0;34", "0;36", "0;31", "0;32", "1;30"];
     function makeSprites(track, l) {
         var sprites = [];
@@ -2321,7 +2455,11 @@ var FLPlayer;
         }
         return sprites;
     }
-    function stepSprites(sprites, l, rms, beat, hardBeat) {
+    // Avatar motion modes (rotate with the visualizer): "float" = free drift +
+    // beat kicks; "gravity" = fall + floor-bounce, jump on beats; "mosh" =
+    // pulled to the centre, explode outward on beats, slam into each other.
+    var SPRITE_MODES = ["float", "gravity", "mosh"];
+    function stepSprites(sprites, l, rms, beat, hardBeat, mode) {
         var minX = 1;
         var maxX = l.cols - AVATAR_W + 1;
         var minY = l.artTop;
@@ -2329,56 +2467,120 @@ var FLPlayer;
         if (maxX <= minX || maxY <= minY)
             return;
         var speed = 0.6 + rms * 1.8; // loudness drives the drift
+        var ccx = (minX + maxX) / 2;
+        var ccy = (minY + maxY) / 2;
         var i;
         for (i = 0; i < sprites.length; i++) {
             var s = sprites[i];
-            if (beat) {
-                // Beat: a jolt — random kick plus a vertical jiggle — and a
-                // quick palette strobe (3 frames through the swap maps).
-                s.vx += (Math.random() - 0.5) * 1.6;
-                s.vy += (Math.random() - 0.5) * 1.2;
-                s.flash = 3;
-            }
-            if (hardBeat) {
-                // Hard accent: glitch out — jittered rows in scramble colors.
-                s.glitch = 3;
-            }
-            else if (beat && s.wiggle === 0 && Math.random() < 0.35) {
-                // Some beats: a quick side-to-side head shake.
+            if (beat)
+                s.flash = 3; // palette strobe
+            if (hardBeat)
+                s.glitch = 3; // glitch-out on hard accents
+            else if (beat && s.wiggle === 0 && Math.random() < 0.35)
                 s.wiggle = 4;
+            var hit = false;
+            if (mode === "gravity") {
+                if (beat) {
+                    s.vy = -(1.3 + rms * 1.7);
+                    s.vx += (Math.random() - 0.5) * 1.7;
+                } // jump
+                s.vy += 0.14; // gravity
+                s.vx = clamp(s.vx, -1.9, 1.9);
+                s.x += s.vx * speed;
+                s.y += s.vy;
+                if (s.x < minX) {
+                    s.x = minX;
+                    s.vx = Math.abs(s.vx);
+                    hit = true;
+                }
+                if (s.x > maxX) {
+                    s.x = maxX;
+                    s.vx = -Math.abs(s.vx);
+                    hit = true;
+                }
+                if (s.y > maxY) {
+                    s.y = maxY;
+                    s.vy = -Math.abs(s.vy) * 0.55;
+                    s.vx *= 0.92;
+                    hit = true;
+                } // floor
+                if (s.y < minY) {
+                    s.y = minY;
+                    s.vy = Math.abs(s.vy) * 0.5;
+                    hit = true;
+                }
             }
-            // Face the direction of travel (flips on bounces + collisions).
+            else if (mode === "mosh") {
+                if (beat) { // explode outward from the centre
+                    var ang = Math.atan2(s.y - ccy, s.x - ccx);
+                    s.vx += Math.cos(ang) * (1.6 + rms * 2.2);
+                    s.vy += Math.sin(ang) * (1.3 + rms * 1.7);
+                }
+                else { // otherwise get pulled back in
+                    s.vx += (ccx - s.x) * 0.022;
+                    s.vy += (ccy - s.y) * 0.022;
+                }
+                s.vx = clamp(s.vx, -2.1, 2.1);
+                s.vy = clamp(s.vy, -1.7, 1.7);
+                s.x += s.vx * speed;
+                s.y += s.vy * speed;
+                if (s.x < minX) {
+                    s.x = minX;
+                    s.vx = Math.abs(s.vx);
+                    hit = true;
+                }
+                if (s.x > maxX) {
+                    s.x = maxX;
+                    s.vx = -Math.abs(s.vx);
+                    hit = true;
+                }
+                if (s.y < minY) {
+                    s.y = minY;
+                    s.vy = Math.abs(s.vy);
+                    hit = true;
+                }
+                if (s.y > maxY) {
+                    s.y = maxY;
+                    s.vy = -Math.abs(s.vy);
+                    hit = true;
+                }
+            }
+            else { // float (default)
+                if (beat) {
+                    s.vx += (Math.random() - 0.5) * 1.6;
+                    s.vy += (Math.random() - 0.5) * 1.2;
+                }
+                s.vx = clamp(s.vx, -1.6, 1.6);
+                s.vy = clamp(s.vy, -1.1, 1.1);
+                s.x += s.vx * speed;
+                s.y += s.vy * speed;
+                if (s.x < minX) {
+                    s.x = minX;
+                    s.vx = Math.abs(s.vx);
+                    hit = true;
+                }
+                if (s.x > maxX) {
+                    s.x = maxX;
+                    s.vx = -Math.abs(s.vx);
+                    hit = true;
+                }
+                if (s.y < minY) {
+                    s.y = minY;
+                    s.vy = Math.abs(s.vy);
+                    hit = true;
+                }
+                if (s.y > maxY) {
+                    s.y = maxY;
+                    s.vy = -Math.abs(s.vy);
+                    hit = true;
+                }
+            }
+            // Face the direction of travel.
             if (s.vx > 0.15)
                 s.facing = 1;
             else if (s.vx < -0.15)
                 s.facing = -1;
-            // Clamp velocity so a pile of beats can't launch them.
-            s.vx = clamp(s.vx, -1.6, 1.6);
-            s.vy = clamp(s.vy, -1.1, 1.1);
-            s.x += s.vx * speed;
-            s.y += s.vy * speed;
-            var bounced = false;
-            if (s.x < minX) {
-                s.x = minX;
-                s.vx = Math.abs(s.vx);
-                bounced = true;
-            }
-            if (s.x > maxX) {
-                s.x = maxX;
-                s.vx = -Math.abs(s.vx);
-                bounced = true;
-            }
-            if (s.y < minY) {
-                s.y = minY;
-                s.vy = Math.abs(s.vy);
-                bounced = true;
-            }
-            if (s.y > maxY) {
-                s.y = maxY;
-                s.vy = -Math.abs(s.vy);
-                bounced = true;
-            }
-            if (bounced || beat)
+            if (hit || beat)
                 s.trail = (s.trail + 1 + Math.floor(Math.random() * 2)) % TRAIL_COLORS.length;
         }
         // Pairwise collision (all pairs): overlap -> swap velocities and separate.
@@ -2532,8 +2734,13 @@ var FLPlayer;
         var emaFast = -1;
         var emaSlow = -1;
         var lastFeatChunk = -1;
-        var autoIdx = 0; // auto rotation: checker -> plasma -> ripple
-        var AUTO_EFFECTS = ["checker", "plasma", "ripple"];
+        var autoIdx = 0; // auto rotation through the field/ascii effects
+        var spriteMode = 0; // avatar motion mode, rotates with the effect
+        var AUTO_EFFECTS = ["checker", "plasma", "ripple", "tunnel", "starfield", "matrix", "fire"];
+        var tunnelT = 0; // tunnel scroll phase
+        var stars = []; // starfield warp points
+        var matrixDrops = []; // matrix rain columns
+        var fireHeat = {}; // fire heat field
         var lastAutoSwitchAt = nowMs();
         var blit = makeArtBlit(track, l);
         var sprites = makeSprites(track, l);
@@ -2606,6 +2813,9 @@ var FLPlayer;
             margins = marginRects(l, blit);
             lyricIdx = -1; // repaint the lyric row after the redraw
             rings = [];
+            stars = [];
+            matrixDrops = [];
+            fireHeat = {}; // positions were screen-relative
             redrawAll();
         }
         // Drop input that leaked in before this track took the keyboard
@@ -2839,6 +3049,7 @@ var FLPlayer;
                     if ((swAge > 8000 && (ratio > 0.4 || ratio < -0.3)) || swAge > 30000) {
                         lastAutoSwitchAt = now;
                         autoIdx = (autoIdx + 1) % AUTO_EFFECTS.length;
+                        spriteMode = (spriteMode + 1) % SPRITE_MODES.length; // vary avatar physics too
                         rings = [];
                         checkerDirty = true;
                         strobeLevel = 3;
@@ -2871,6 +3082,9 @@ var FLPlayer;
                 if (bg === "auto")
                     bg = AUTO_EFFECTS[autoIdx]; // rotated by the music above
                 var bgPainted = false;
+                var fxCx = Math.floor(l.cols / 2); // effect centre (tunnel/starfield)
+                var fxCy = Math.floor((l.artTop + l.artBottom) / 2);
+                var STAR_COUNT = Math.max(40, Math.min(120, Math.floor(l.cols * l.rows / 45)));
                 if (margins.length && BG_MODES[bgMode] !== "off" && !paused) {
                     fieldTick++;
                     if ((BG_MODES[bgMode] === "auto" || BG_MODES[bgMode] === "strobe") && hardBeat)
@@ -2920,6 +3134,29 @@ var FLPlayer;
                             bgPainted = true;
                         }
                     }
+                    else if (bg === "tunnel") {
+                        tunnelT += 0.15 + features.rms * 0.55;
+                        if (beat)
+                            tunnelT += 0.8;
+                        if (fieldTick % 2 === 0 || beat) {
+                            drawTunnel(margins, tunnelT, features.zcr, fxCx, fxCy);
+                            bgPainted = true;
+                        }
+                    }
+                    else if (bg === "starfield") {
+                        stepStars(stars, STAR_COUNT, fxCx, fxCy, l.cols, l.rows, l.artTop, features.rms);
+                        drawStars(margins, stars, fxCx, fxCy);
+                        bgPainted = true;
+                    }
+                    else if (bg === "matrix") {
+                        stepMatrix(matrixDrops, l.cols, l.rows, l.artTop, features.rms, beat);
+                        drawMatrix(margins, matrixDrops);
+                        bgPainted = true;
+                    }
+                    else if (bg === "fire") {
+                        drawFire(margins, fireHeat, l.cols, l.rows, l.artTop, features.rms, beat);
+                        bgPainted = true;
+                    }
                 }
                 if (mode !== "off" && borderPulse > 0) {
                     drawBoxFrame(l, borderPulse >= 2 ? "1;36" : "0;36");
@@ -2935,7 +3172,7 @@ var FLPlayer;
                 drawGlow(l, l.glowRow2, paused ? 0 : features.rms, features.zcr, glowOn);
                 // Floating avatars: physics every tick, redraw when they move.
                 if (sprites.length && !paused) {
-                    stepSprites(sprites, l, features.rms, beat, hardBeat);
+                    stepSprites(sprites, l, features.rms, beat, hardBeat, SPRITE_MODES[spriteMode]);
                     drawSprites(sprites, l, blit, false);
                 }
                 // Synced lyric line between the strips: a new line launches a
