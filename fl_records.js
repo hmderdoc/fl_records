@@ -2925,7 +2925,8 @@ var FLPlayer;
                 exiting: false,
                 targetX: sx,
                 targetY: l.artTop + Math.floor(zoneH / 2),
-                targetTicks: 0
+                targetTicks: 0,
+                groundedTicks: 0
             });
         }
         return sprites;
@@ -3021,8 +3022,23 @@ var FLPlayer;
                     s.vy = Math.abs(s.vy) * 0.5;
                     hit = true;
                 }
+                // Small bounces eventually quantize to the same bottom row,
+                // where erase/redraw can look like flicker. Detect that low-
+                // velocity floor stall and make each sprite self-jump on a
+                // slightly different schedule, even through a beatless lull.
+                if (s.y >= maxY - 0.15 && Math.abs(s.vy) < 0.48)
+                    s.groundedTicks++;
+                else
+                    s.groundedTicks = 0;
+                if (s.groundedTicks >= 7 + (i % 5)) {
+                    s.vy = -(1.15 + Math.random() * 0.85 + rms * 1.2);
+                    s.vx += (Math.random() - 0.5) * 1.4;
+                    s.wiggle = Math.max(s.wiggle, 3);
+                    s.groundedTicks = 0;
+                }
             }
             else if (mode === "mosh") {
+                s.groundedTicks = 0;
                 // Guests charge changing targets in the central pit. The
                 // current track's performers stay around its perimeter and do
                 // an independent solo slam-dance instead of joining the clump.
@@ -3093,6 +3109,7 @@ var FLPlayer;
                 }
             }
             else { // float (default)
+                s.groundedTicks = 0;
                 if (beat) {
                     s.vx += (Math.random() - 0.5) * 1.6;
                     s.vy += (Math.random() - 0.5) * 1.2;
