@@ -2164,6 +2164,8 @@ namespace FLPlayer {
         var eqPeaks: number[] = [];  // equaliser peak-hold caps
         var eqT = 0;                 // equaliser oscillation phase
         var lastAutoSwitchAt = nowMs();
+        var lastNeonAt = 0;
+        var neonPromotionLyric = -2;
 
         var blit = makeArtBlit(track, l);
         var sprites = makeSprites(track, l);
@@ -2200,6 +2202,7 @@ namespace FLPlayer {
         if (lyrics.length) {
             AUTO_EFFECTS.push("lyrics");   // rain the vocals -- only on tracks that have them
             AUTO_EFFECTS.push("neon");     // giant TDF phrase punctuation
+            autoIdx = Math.floor(Math.random() * AUTO_EFFECTS.length);
         }
         // Size the lyric strip to this track's longest line so a wide terminal
         // shows full lines instead of ellipsis. Per track (stable across lines),
@@ -2488,6 +2491,25 @@ namespace FLPlayer {
                 // steady section still rotates on the 24s fallback. The switch
                 // announces itself with a strobe flash.
                 if (BG_MODES[bgMode] === "auto" && !paused && secRms >= 0) {
+                    var autoLyricIdx = lyricIndexFor(lyrics, playMs / 1000, lyricIdx);
+                    var autoVocalsActive = lyrics.length > 0 &&
+                        (!hasTimedLyrics || lyricVocalActive(lyrics, playMs / 1000, autoLyricIdx));
+                    var neonIdx = AUTO_EFFECTS.indexOf("neon");
+
+                    // A new active lyric can promote the neon scene directly;
+                    // the cooldown prevents rapid mode thrashing while still
+                    // making it appear several times in a typical vocal track.
+                    if (autoLyricIdx !== neonPromotionLyric) {
+                        neonPromotionLyric = autoLyricIdx;
+                        if (autoVocalsActive && neonIdx >= 0 && AUTO_EFFECTS[autoIdx] !== "neon" &&
+                            now - lastNeonAt > 9000 && Math.random() < 0.34) {
+                            autoIdx = neonIdx;
+                            lastNeonAt = now;
+                            lastAutoSwitchAt = now;
+                            secBaseRms = secRms; secBaseZcr = secZcr;
+                            wipeActive = false; rings = []; checkerDirty = true;
+                        }
+                    }
                     var swAge = now - lastAutoSwitchAt;
                     var dRms = Math.abs(secRms - secBaseRms) / Math.max(secBaseRms, 0.05);
                     var dZcr = Math.abs(secZcr - secBaseZcr);
@@ -2499,8 +2521,13 @@ namespace FLPlayer {
                         // -- equalizer included -- come up evenly, not just the
                         // first few in a sequential 2-minute track.
                         var prevA = autoIdx;
-                        do { autoIdx = Math.floor(Math.random() * AUTO_EFFECTS.length); }
-                        while (autoIdx === prevA && AUTO_EFFECTS.length > 1);
+                        if (autoVocalsActive && neonIdx >= 0 && Math.random() < 0.42) {
+                            autoIdx = neonIdx;
+                        } else {
+                            do { autoIdx = Math.floor(Math.random() * AUTO_EFFECTS.length); }
+                            while (autoIdx === prevA && AUTO_EFFECTS.length > 1);
+                        }
+                        if (AUTO_EFFECTS[autoIdx] === "neon") lastNeonAt = now;
                         spriteMode = (spriteMode + 1) % SPRITE_MODES.length;   // vary avatar physics too
                         wipeActive = false;
                         rings = [];
