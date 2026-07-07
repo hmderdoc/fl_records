@@ -2723,6 +2723,66 @@ var FLPlayer;
         }
         return { rows: rows, width: width, height: font.height };
     }
+    function neonWrappedGrid(phrase, font, maxWidth, maxHeight, maxLines) {
+        var words = phrase.split(/\s+/);
+        var lines = [];
+        var current = "";
+        for (var i = 0; i < words.length; i++) {
+            var trial = current.length ? current + " " + words[i] : words[i];
+            var measured = neonGrid(trial, font);
+            if (measured && measured.width <= maxWidth) {
+                current = trial;
+            }
+            else {
+                if (!current.length || lines.length + 1 >= maxLines)
+                    return null;
+                lines.push(current);
+                current = words[i];
+                var lone = neonGrid(current, font);
+                if (!lone || lone.width > maxWidth)
+                    return null;
+            }
+        }
+        if (current.length)
+            lines.push(current);
+        if (!lines.length || lines.length > maxLines)
+            return null;
+        var rendered = [];
+        var width = 0;
+        for (var li = 0; li < lines.length; li++) {
+            var lineGrid = neonGrid(lines[li], font);
+            if (!lineGrid)
+                return null;
+            rendered.push(lineGrid);
+            if (lineGrid.width > width)
+                width = lineGrid.width;
+        }
+        var gap = lines.length > 1 ? 1 : 0;
+        var height = lines.length * font.height + (lines.length - 1) * gap;
+        if (height > maxHeight)
+            return null;
+        var rows = [];
+        for (var ri = 0; ri < rendered.length; ri++) {
+            var pad = Math.floor((width - rendered[ri].width) / 2);
+            for (var y = 0; y < rendered[ri].height; y++) {
+                var row = [];
+                for (var lp = 0; lp < pad; lp++)
+                    row.push(0);
+                row = row.concat(rendered[ri].rows[y]);
+                while (row.length < width)
+                    row.push(0);
+                rows.push(row);
+            }
+            if (ri + 1 < rendered.length)
+                for (var gp = 0; gp < gap; gp++) {
+                    var blank = [];
+                    while (blank.length < width)
+                        blank.push(0);
+                    rows.push(blank);
+                }
+        }
+        return { rows: rows, width: width, height: height };
+    }
     function makeNeonSign(text, zoneW, zoneH, now) {
         // Evaluate a broad sample instead of accepting the first fit. Score
         // both height and width occupancy, with a smaller reward for retaining
@@ -2734,17 +2794,21 @@ var FLPlayer;
             var font = nextNeonFont();
             if (!font || font.height > zoneH || font.height < 3)
                 continue;
-            for (var wordCap = 7; wordCap >= 1; wordCap--) {
+            for (var wordCap = 10; wordCap >= 1; wordCap--) {
                 var phrase = neonPhrase(text, wordCap);
                 if (!phrase.length)
                     continue;
-                var grid = neonGrid(phrase, font);
-                if (!grid || grid.width > zoneW + 4)
+                var possibleLines = Math.min(3, Math.floor((zoneH + 1) / Math.max(1, font.height + 1)));
+                var useLines = possibleLines > 1 && Math.random() < 0.72 ? possibleLines : 1;
+                var grid = useLines > 1
+                    ? neonWrappedGrid(phrase, font, zoneW, zoneH, useLines)
+                    : neonGrid(phrase, font);
+                if (!grid || grid.width > zoneW)
                     continue;
                 var wordCount = phrase.split(" ").length;
                 var score = (grid.height / zoneH) * 0.55 +
                     (Math.min(grid.width, zoneW) / zoneW) * 0.30 +
-                    (Math.min(wordCount, 7) / 7) * 0.15;
+                    (Math.min(wordCount, 10) / 10) * 0.15;
                 var primary = NEON_FG[Math.floor(Math.random() * (NEON_FG.length - 1))];
                 var candidate = {
                     phrase: phrase, fontName: String(font.name || "TDF"),
@@ -4177,6 +4241,11 @@ var FLPlayer;
         var testNeon = neonGrid("NEON", testFont);
         if (!testNeon || testNeon.width < 4 || testNeon.height < 1)
             throw new Error("TDF neon grid failed");
+        var testTwoWords = neonGrid("NEON LIGHTS", testFont);
+        var testWrapped = testTwoWords && neonWrappedGrid("NEON LIGHTS", testFont, Math.max(1, testTwoWords.width - 2), testFont.height * 2 + 1, 2);
+        if (!testWrapped || testWrapped.height <= testFont.height ||
+            testWrapped.width >= (testTwoWords ? testTwoWords.width : 9999))
+            throw new Error("TDF neon wrap failed");
         // Key normalization: every arrow representation -> the cursor code.
         var nk = [
             ["\x1b[A", "\x1e"], ["\x1bOA", "\x1e"], ["\x1e", "\x1e"], // up
