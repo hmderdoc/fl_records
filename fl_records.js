@@ -2712,7 +2712,8 @@ var FLPlayer;
                 for (var x = 0; x < gw; x++) {
                     var cell = gg && gg.cell[gg.width * y + x];
                     var code = cell && cell.utfchar ? cell.utfchar.charCodeAt(0) & 0xff : 0x20;
-                    row.push(code === 0x20 ? 0 : code);
+                    var color = cell && cell.color !== undefined ? cell.color & 0xff : 7;
+                    row.push(code === 0x20 ? 0 : ((color << 8) | code));
                 }
                 if (g + 1 < glyphs.length)
                     for (var sp = 0; sp < font.spacing; sp++)
@@ -2723,30 +2724,46 @@ var FLPlayer;
         return { rows: rows, width: width, height: font.height };
     }
     function makeNeonSign(text, zoneW, zoneH, now) {
-        // Prefer a phrase, then progressively shorten it until one of the many
-        // available fonts fits both dimensions.
-        for (var wordCap = 4; wordCap >= 1; wordCap--) {
-            var phrase = neonPhrase(text, wordCap);
-            if (!phrase.length)
+        // Evaluate a broad sample instead of accepting the first fit. Score
+        // both height and width occupancy, with a smaller reward for retaining
+        // more words, so signs become substantially larger without collapsing
+        // every lyric to a single word.
+        var best = null;
+        var bestScore = -1;
+        for (var attempt = 0; attempt < 32; attempt++) {
+            var font = nextNeonFont();
+            if (!font || font.height > zoneH || font.height < 3)
                 continue;
-            for (var attempt = 0; attempt < 18; attempt++) {
-                var font = nextNeonFont();
-                if (!font || font.height > zoneH || font.height < 3)
+            for (var wordCap = 7; wordCap >= 1; wordCap--) {
+                var phrase = neonPhrase(text, wordCap);
+                if (!phrase.length)
                     continue;
                 var grid = neonGrid(phrase, font);
-                if (!grid || grid.width > zoneW + 8)
-                    continue; // small overflow is useful for panning
-                return {
+                if (!grid || grid.width > zoneW + 4)
+                    continue;
+                var wordCount = phrase.split(" ").length;
+                var score = (grid.height / zoneH) * 0.55 +
+                    (Math.min(grid.width, zoneW) / zoneW) * 0.30 +
+                    (Math.min(wordCount, 7) / 7) * 0.15;
+                var primary = NEON_FG[Math.floor(Math.random() * (NEON_FG.length - 1))];
+                var candidate = {
                     phrase: phrase, fontName: String(font.name || "TDF"),
                     rows: grid.rows, width: grid.width, height: grid.height,
                     born: now, style: Math.floor(Math.random() * 6),
-                    fg: NEON_FG[Math.floor(Math.random() * NEON_FG.length)],
+                    fg: primary,
+                    fg2: NEON_FG[(NEON_FG.indexOf(primary) + 2 + Math.floor(Math.random() * 3)) % NEON_FG.length],
+                    accent: Math.random() < 0.5 ? 15 : 14,
                     bg: Math.random() < 0.28 ? [1, 4, 5][Math.floor(Math.random() * 3)] : 0,
                     direction: Math.random() < 0.5 ? -1 : 1
                 };
+                if (score > bestScore) {
+                    best = candidate;
+                    bestScore = score;
+                }
+                break; // longest phrase that fits this font
             }
         }
-        return null;
+        return best;
     }
     function drawNeonSign(sign, l, now, beat, hardBeat, transitionKind, transitionProgress, incoming) {
         var zoneH = l.artBottom - l.artTop + 1;
@@ -2764,6 +2781,10 @@ var FLPlayer;
         else if (sign.style === 5) { // gentle vertical marquee drift
             oy += Math.round(Math.sin(age / 900) * Math.max(1, (zoneH - sign.height) / 3));
         }
+        if (sign.style === 0) // compact beat-sign bounce
+            oy -= Math.round(Math.abs(Math.sin(age / 240)) * 2);
+        else if (sign.style === 3) // nervous neon-tube wiggle
+            ox += Math.round(Math.sin(age / 115) * 2);
         // Transition geometry is independent of the sign's idle animation.
         // Each lyric therefore gets one of many entrances and a separately
         // selected departure rather than repeating one canned cross-fade.
@@ -2780,6 +2801,8 @@ var FLPlayer;
         var bg = sign.bg;
         if (beat && sign.style === 4 && Math.random() < 0.35)
             bg = [0, 1, 4, 5][Math.floor(Math.random() * 4)];
+        else if (sign.bg && sign.style === 5)
+            bg = [1, 4, 5, 3, 6][Math.floor(age / 900) % 5];
         var out = "";
         for (var sy = 0; sy < zoneH; sy++) {
             out += gotoRC(l.artTop + sy, 1);
@@ -2791,9 +2814,12 @@ var FLPlayer;
                     var blastForce = entering ? (1 - tp) : tp;
                     blastShift = Math.round((gy - sign.height / 2) * blastForce * sign.direction * 1.4);
                 }
+                if (tk < 0 && sign.style === 4)
+                    blastShift += Math.round(Math.sin(age / 135 + gy * 1.7) * 2);
                 var gx = sx - ox - blastShift;
-                var code = gy >= 0 && gy < sign.height && gx >= 0 && gx < sign.width
+                var packed = gy >= 0 && gy < sign.height && gx >= 0 && gx < sign.width
                     ? sign.rows[gy][gx] : 0;
+                var code = packed & 0xff;
                 var visible = !!code;
                 if (visible && sign.style === 0)
                     visible = gx <= Math.floor(sign.width * reveal); // L->R wipe
@@ -2827,7 +2853,24 @@ var FLPlayer;
                         (gy > 0 && sign.rows[gy - 1][gx]) ||
                         (gy + 1 < sign.height && sign.rows[gy + 1][gx]));
                 }
-                var fg = visible ? sign.fg : (glow ? (sign.fg & 7) : 0);
+                // Preserve the TDF's color distinctions, but remap them into a
+                // coherent neon triad. A moving highlight band shimmers across
+                // the glyph and selected styles continuously rotate the triad.
+                var srcColor = (packed >> 8) & 0xff;
+                var tone = srcColor & 0x0f;
+                var toneBand = (tone + Math.floor(gx * 3 / Math.max(1, sign.width)) +
+                    Math.floor(gy * 2 / Math.max(1, sign.height))) % 3;
+                var fg = toneBand === 0 ? sign.fg : (toneBand === 1 ? sign.fg2 : sign.accent);
+                var shimmer = Math.abs(((gx + gy * 2 + Math.floor(age / 100)) % 18) - 9) <= 1;
+                if (visible && shimmer)
+                    fg = sign.accent;
+                if (visible && (sign.style === 2 || sign.style === 5)) {
+                    var baseIdx = NEON_FG.indexOf(fg);
+                    if (baseIdx >= 0)
+                        fg = NEON_FG[(baseIdx + Math.floor(age / 650)) % NEON_FG.length];
+                }
+                if (!visible)
+                    fg = glow ? (sign.fg & 7) : 0;
                 var attr = (fg & 7) | (fg > 7 ? 8 : 0) | (bg << 4);
                 if (attr !== lastAttr) {
                     out += sgr("0" + (attr & 8 ? ";1" : "") + ";" +
