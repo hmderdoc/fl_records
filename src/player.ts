@@ -1523,7 +1523,7 @@ namespace FLPlayer {
             }
             // Reuse some parsed fonts, but keep loading new ones so long tracks
             // do not settle into a tiny visual vocabulary.
-            if (neonFonts.length && Math.random() < 0.35)
+            if (neonFonts.length && Math.random() < 0.80)
                 return neonFonts[Math.floor(Math.random() * neonFonts.length)];
             if (!neonFontFiles || !neonFontFiles.length) return null;
             neonTdf.opt = {
@@ -1597,9 +1597,13 @@ namespace FLPlayer {
         return null;
     }
 
-    function drawNeonSign(sign: NeonSign, l: Layout, now: number, beat: boolean, hardBeat: boolean): void {
+    function drawNeonSign(sign: NeonSign, l: Layout, now: number, beat: boolean, hardBeat: boolean,
+        transitionKind?: number, transitionProgress?: number, incoming?: boolean): void {
         var zoneH = l.artBottom - l.artTop + 1;
         var age = now - sign.born;
+        var tk = transitionKind === undefined ? -1 : transitionKind;
+        var tp = clamp(transitionProgress === undefined ? 1 : transitionProgress, 0, 1);
+        var entering = !!incoming;
         var reveal = clamp(age / (850 + sign.style * 90), 0, 1);
         var ox = Math.floor((l.cols - sign.width) / 2);
         var oy = Math.floor((zoneH - sign.height) / 2);
@@ -1608,6 +1612,18 @@ namespace FLPlayer {
             ox += Math.round(sign.direction * ((1 - enter) * l.cols + Math.sin(age / 850) * 4));
         } else if (sign.style === 5) { // gentle vertical marquee drift
             oy += Math.round(Math.sin(age / 900) * Math.max(1, (zoneH - sign.height) / 3));
+        }
+        // Transition geometry is independent of the sign's idle animation.
+        // Each lyric therefore gets one of many entrances and a separately
+        // selected departure rather than repeating one canned cross-fade.
+        if (tk === 0) // horizontal pan
+            ox += Math.round(sign.direction * l.cols * (entering ? (1 - tp) : tp));
+        else if (tk === 1) // vertical fly
+            oy += Math.round(sign.direction * zoneH * (entering ? (1 - tp) : tp));
+        else if (tk === 4) { // impact/explosion shake
+            var force = entering ? (1 - tp) : tp;
+            ox += Math.round(Math.sin(tp * 31 + sign.width) * force * 5);
+            oy += Math.round(Math.cos(tp * 23 + sign.height) * force * 2);
         }
         var flicker = (sign.style === 3 && ((Math.floor(age / 90) % 11) === 2 || hardBeat));
         var bg = sign.bg;
@@ -1618,13 +1634,38 @@ namespace FLPlayer {
             out += gotoRC(l.artTop + sy, 1);
             var lastAttr = -1;
             for (var sx = 0; sx < l.cols; sx++) {
-                var gx = sx - ox, gy = sy - oy;
+                var gy = sy - oy;
+                var blastShift = 0;
+                if (tk === 4) {
+                    var blastForce = entering ? (1 - tp) : tp;
+                    blastShift = Math.round((gy - sign.height / 2) * blastForce * sign.direction * 1.4);
+                }
+                var gx = sx - ox - blastShift;
                 var code = gy >= 0 && gy < sign.height && gx >= 0 && gx < sign.width
                     ? sign.rows[gy][gx] : 0;
                 var visible = !!code;
                 if (visible && sign.style === 0) visible = gx <= Math.floor(sign.width * reveal);       // L->R wipe
                 if (visible && sign.style === 2) visible = gy >= Math.floor(sign.height * (1 - reveal)); // rising fill
                 if (visible && flicker && ((sx + sy + Math.floor(age / 90)) % 4 !== 0)) visible = false;
+                if (visible && tk === 2) { // directional wipe
+                    var wipePos = sign.direction > 0 ? gx / Math.max(1, sign.width - 1) :
+                        1 - gx / Math.max(1, sign.width - 1);
+                    visible = entering ? wipePos <= tp : wipePos >= tp;
+                }
+                if (visible && tk === 3) { // deterministic cell dissolve
+                    var dust = ((gx * 37 + gy * 71 + sign.width * 11) % 100) / 100;
+                    visible = entering ? dust <= tp : dust >= tp;
+                }
+                if (visible && tk === 5) { // alternating venetian blinds
+                    var blind = ((gy % 2) ? (1 - gx / Math.max(1, sign.width)) :
+                        gx / Math.max(1, sign.width));
+                    visible = entering ? blind <= tp : blind >= tp;
+                }
+                if (visible && tk === 4) { // explosion/implosion dropout
+                    var debris = ((gx * 19 + gy * 43 + Math.floor(tp * 10)) % 100) / 100;
+                    var keep = entering ? tp : (1 - tp);
+                    visible = debris <= keep;
+                }
                 var glow = false;
                 if (!visible && gx >= 0 && gy >= 0 && gx < sign.width && gy < sign.height) {
                     glow = !!((gx > 0 && sign.rows[gy][gx - 1]) ||
@@ -2053,8 +2094,13 @@ namespace FLPlayer {
         var lyricDrops: LyricDrop[] = [];  // lyric-rain word streams
         var rainSrc = "";            // last active lyric line (rain material; persists gaps)
         var neonSign: NeonSign | null = null;
+        var neonNextSign: NeonSign | null = null;
         var neonSeenLyric = -2;
         var neonLastDraw = 0;
+        var neonTransitionAt = 0;
+        var neonOutFx = 0;
+        var neonInFx = 0;
+        var NEON_TRANSITION_MS = 1500;
         var lastEffectiveBg = "";
         var fireHeat: { [k: string]: number } = {};  // fire heat field
         var eqBars: number[] = [];   // equaliser bar heights (per column)
@@ -2142,7 +2188,9 @@ namespace FLPlayer {
             stars = []; lyricDrops = []; fireHeat = {};   // positions were screen-relative
             eqBars = []; eqPeaks = [];
             neonSign = null;
+            neonNextSign = null;
             neonSeenLyric = -2;
+            neonTransitionAt = 0;
             wipeActive = false;
             redrawAll();
         }
@@ -2470,6 +2518,8 @@ namespace FLPlayer {
                     // Neon owns the full art zone, unlike margin effects.
                     // Restore the album art as soon as another effect takes over.
                     neonSign = null;
+                    neonNextSign = null;
+                    neonTransitionAt = 0;
                     drawArt(blit);
                     drawSprites(sprites, l, blit, true);
                 }
@@ -2487,15 +2537,40 @@ namespace FLPlayer {
                         neonSeenLyric = fxLyricIdx;
                     } else if (fxLyricIdx !== neonSeenLyric) {
                         neonSeenLyric = fxLyricIdx;
-                        // Do not throw every line at the wall. A new sign is a
-                        // punctuation hit, spaced far enough apart to read.
-                        if (fxLyricIdx >= 0 && lyrics[fxLyricIdx] && neonSign &&
-                            now - neonSign.born > 4200 && Math.random() < 0.55)
-                            neonSign = makeNeonSign(lyrics[fxLyricIdx].text, l.cols,
-                                l.artBottom - l.artTop + 1, now) || neonSign;
+                        if (fxLyricIdx >= 0 && lyrics[fxLyricIdx]) {
+                            var prepared = makeNeonSign(lyrics[fxLyricIdx].text, l.cols,
+                                l.artBottom - l.artTop + 1, now);
+                            if (prepared) {
+                                if (neonSign) {
+                                    neonNextSign = prepared;
+                                    neonTransitionAt = now;
+                                    neonOutFx = Math.floor(Math.random() * 6);
+                                    do { neonInFx = Math.floor(Math.random() * 6); }
+                                    while (neonInFx === neonOutFx);
+                                } else neonSign = prepared;
+                            }
+                        }
                     }
-                    if (neonSign && (now - neonLastDraw > 260 || beat)) {
-                        drawNeonSign(neonSign, l, now, beat, hardBeat);
+                    if (neonSign && (now - neonLastDraw > 180 || beat)) {
+                        if (neonNextSign && neonTransitionAt > 0) {
+                            var transP = clamp((now - neonTransitionAt) / NEON_TRANSITION_MS, 0, 1);
+                            // Sequential halves keep the full-zone backing
+                            // coherent while still giving both lyrics a strong,
+                            // distinct transition instead of a blank cut.
+                            if (transP < 0.5)
+                                drawNeonSign(neonSign, l, now, beat, hardBeat,
+                                    neonOutFx, transP * 2, false);
+                            else
+                                drawNeonSign(neonNextSign, l, now, beat, hardBeat,
+                                    neonInFx, (transP - 0.5) * 2, true);
+                            if (transP >= 1) {
+                                neonSign = neonNextSign;
+                                neonNextSign = null;
+                                neonTransitionAt = 0;
+                            }
+                        } else {
+                            drawNeonSign(neonSign, l, now, beat, hardBeat);
+                        }
                         neonLastDraw = now;
                         bgPainted = true;
                     }
