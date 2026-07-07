@@ -1059,7 +1059,7 @@ namespace FLPlayer {
     // shade/color follow loudness/brightness, with a bright strobe flash
     // decaying over a few frames on hard beats. The lyric line, glow strips,
     // box and hints rows are never touched. [B] cycles auto/checker/strobe/off.
-    var BG_MODES = ["auto", "checker", "plasma", "ripple", "tunnel", "starfield", "lyrics", "fire", "equalizer", "spiral", "aurora", "sweep", "strobe", "off"];
+    var BG_MODES = ["auto", "checker", "plasma", "ripple", "tunnel", "starfield", "lyrics", "neon", "fire", "equalizer", "spiral", "aurora", "sweep", "strobe", "off"];
 
     interface Rect { x: number; y: number; w: number; h: number; }
 
@@ -1481,6 +1481,173 @@ namespace FLPlayer {
         });
     }
 
+    // ---- giant TDF lyric signs ---------------------------------------------
+    // TDF glyph dimensions are measured before selection, so even wildly
+    // different TheDraw fonts are safe at arbitrary terminal sizes. Only a
+    // short phrase is used: this is visual punctuation, not another lyric row.
+    interface NeonSign {
+        phrase: string;
+        fontName: string;
+        rows: number[][];       // CP437 glyph bytes; 0 means transparent
+        width: number;
+        height: number;
+        born: number;
+        style: number;
+        fg: number;
+        bg: number;
+        direction: number;
+    }
+
+    var neonTdf: any = null;
+    var neonFontFiles: string[] | null = null;
+    var neonFonts: any[] = [];
+    var NEON_FG = [9, 10, 11, 12, 13, 14, 15];
+    var NEON_SUB = [0xb0, 0xb1, 0xb2, 0xdb, 0xdc, 0xdf];
+
+    function neonPhrase(text: string, maxWords: number): string {
+        var clean = String(text || "").replace(/[^A-Za-z0-9' ]+/g, " ")
+            .replace(/^\s+|\s+$/g, "").replace(/\s+/g, " ").toUpperCase();
+        if (!clean.length) return "";
+        var words = clean.split(" ");
+        if (words.length <= maxWords) return clean;
+        var take = Math.min(maxWords, 2 + Math.floor(Math.random() * Math.max(1, maxWords - 1)));
+        var start = Math.floor(Math.random() * (words.length - take + 1));
+        return words.slice(start, start + take).join(" ");
+    }
+
+    function nextNeonFont(): any {
+        try {
+            if (!neonTdf) {
+                neonTdf = load({}, "tdfonts_lib.js");
+                neonFontFiles = directory(system.ctrl_dir + "tdfonts/*.tdf");
+            }
+            // Reuse some parsed fonts, but keep loading new ones so long tracks
+            // do not settle into a tiny visual vocabulary.
+            if (neonFonts.length && Math.random() < 0.35)
+                return neonFonts[Math.floor(Math.random() * neonFonts.length)];
+            if (!neonFontFiles || !neonFontFiles.length) return null;
+            neonTdf.opt = {
+                ansi: true, utf8: false, random: true,
+                fontdir: system.ctrl_dir + "tdfonts/"
+            };
+            var file = neonFontFiles[Math.floor(Math.random() * neonFontFiles.length)];
+            var font = neonTdf.loadfont(file);
+            if (font) {
+                neonFonts.push(font);
+                if (neonFonts.length > 48) neonFonts.shift();
+            }
+            return font;
+        } catch (ignored) {
+            return null;
+        }
+    }
+
+    function neonGrid(phrase: string, font: any): { rows: number[][]; width: number; height: number } | null {
+        if (!font || !font.glyphs || !phrase.length) return null;
+        var glyphs: any[] = [];
+        var width = 0;
+        for (var i = 0; i < phrase.length; i++) {
+            var idx = neonTdf.lookupchar(phrase.charAt(i), font);
+            var glyph = idx >= 0 ? font.glyphs[idx] : null;
+            glyphs.push(glyph);
+            width += glyph ? glyph.width : Math.max(1, font.spacing);
+            if (i + 1 < phrase.length) width += font.spacing;
+        }
+        if (!width || !font.height) return null;
+        var rows: number[][] = [];
+        for (var y = 0; y < font.height; y++) {
+            var row: number[] = [];
+            for (var g = 0; g < glyphs.length; g++) {
+                var gg = glyphs[g];
+                var gw = gg ? gg.width : Math.max(1, font.spacing);
+                for (var x = 0; x < gw; x++) {
+                    var cell = gg && gg.cell[gg.width * y + x];
+                    var code = cell && cell.utfchar ? cell.utfchar.charCodeAt(0) & 0xff : 0x20;
+                    row.push(code === 0x20 ? 0 : code);
+                }
+                if (g + 1 < glyphs.length)
+                    for (var sp = 0; sp < font.spacing; sp++) row.push(0);
+            }
+            rows.push(row);
+        }
+        return { rows: rows, width: width, height: font.height };
+    }
+
+    function makeNeonSign(text: string, zoneW: number, zoneH: number, now: number): NeonSign | null {
+        // Prefer a phrase, then progressively shorten it until one of the many
+        // available fonts fits both dimensions.
+        for (var wordCap = 4; wordCap >= 1; wordCap--) {
+            var phrase = neonPhrase(text, wordCap);
+            if (!phrase.length) continue;
+            for (var attempt = 0; attempt < 18; attempt++) {
+                var font = nextNeonFont();
+                if (!font || font.height > zoneH || font.height < 3) continue;
+                var grid = neonGrid(phrase, font);
+                if (!grid || grid.width > zoneW + 8) continue; // small overflow is useful for panning
+                return {
+                    phrase: phrase, fontName: String(font.name || "TDF"),
+                    rows: grid.rows, width: grid.width, height: grid.height,
+                    born: now, style: Math.floor(Math.random() * 6),
+                    fg: NEON_FG[Math.floor(Math.random() * NEON_FG.length)],
+                    bg: Math.random() < 0.28 ? [1, 4, 5][Math.floor(Math.random() * 3)] : 0,
+                    direction: Math.random() < 0.5 ? -1 : 1
+                };
+            }
+        }
+        return null;
+    }
+
+    function drawNeonSign(sign: NeonSign, l: Layout, now: number, beat: boolean, hardBeat: boolean): void {
+        var zoneH = l.artBottom - l.artTop + 1;
+        var age = now - sign.born;
+        var reveal = clamp(age / (850 + sign.style * 90), 0, 1);
+        var ox = Math.floor((l.cols - sign.width) / 2);
+        var oy = Math.floor((zoneH - sign.height) / 2);
+        if (sign.style === 1) { // slow horizontal sign-pan, entering from one side
+            var enter = clamp(age / 1200, 0, 1);
+            ox += Math.round(sign.direction * ((1 - enter) * l.cols + Math.sin(age / 850) * 4));
+        } else if (sign.style === 5) { // gentle vertical marquee drift
+            oy += Math.round(Math.sin(age / 900) * Math.max(1, (zoneH - sign.height) / 3));
+        }
+        var flicker = (sign.style === 3 && ((Math.floor(age / 90) % 11) === 2 || hardBeat));
+        var bg = sign.bg;
+        if (beat && sign.style === 4 && Math.random() < 0.35)
+            bg = [0, 1, 4, 5][Math.floor(Math.random() * 4)];
+        var out = "";
+        for (var sy = 0; sy < zoneH; sy++) {
+            out += gotoRC(l.artTop + sy, 1);
+            var lastAttr = -1;
+            for (var sx = 0; sx < l.cols; sx++) {
+                var gx = sx - ox, gy = sy - oy;
+                var code = gy >= 0 && gy < sign.height && gx >= 0 && gx < sign.width
+                    ? sign.rows[gy][gx] : 0;
+                var visible = !!code;
+                if (visible && sign.style === 0) visible = gx <= Math.floor(sign.width * reveal);       // L->R wipe
+                if (visible && sign.style === 2) visible = gy >= Math.floor(sign.height * (1 - reveal)); // rising fill
+                if (visible && flicker && ((sx + sy + Math.floor(age / 90)) % 4 !== 0)) visible = false;
+                var glow = false;
+                if (!visible && gx >= 0 && gy >= 0 && gx < sign.width && gy < sign.height) {
+                    glow = !!((gx > 0 && sign.rows[gy][gx - 1]) ||
+                        (gx + 1 < sign.width && sign.rows[gy][gx + 1]) ||
+                        (gy > 0 && sign.rows[gy - 1][gx]) ||
+                        (gy + 1 < sign.height && sign.rows[gy + 1][gx]));
+                }
+                var fg = visible ? sign.fg : (glow ? (sign.fg & 7) : 0);
+                var attr = (fg & 7) | (fg > 7 ? 8 : 0) | (bg << 4);
+                if (attr !== lastAttr) {
+                    out += sgr("0" + (attr & 8 ? ";1" : "") + ";" +
+                        [30,34,32,36,31,35,33,37][attr & 7] + ";" +
+                        ([40,44,42,46,41,45,43,47][bg]));
+                    lastAttr = attr;
+                }
+                if (visible && sign.style === 4 && ((sx + sy + Math.floor(age / 180)) % 7 === 0))
+                    out += String.fromCharCode(NEON_SUB[(sx + sy) % NEON_SUB.length]);
+                else out += visible ? String.fromCharCode(code) : (glow ? "\xb0" : " ");
+            }
+        }
+        console.write(out + CLR);
+    }
+
     // ---- floating avatar sprites ---------------------------------------------
     // Avatars drift over the art like a screensaver, bounce off the art-zone
     // walls and each other, speed up with loudness, and get a velocity kick
@@ -1885,6 +2052,10 @@ namespace FLPlayer {
         var stars: Star[] = [];      // starfield warp points
         var lyricDrops: LyricDrop[] = [];  // lyric-rain word streams
         var rainSrc = "";            // last active lyric line (rain material; persists gaps)
+        var neonSign: NeonSign | null = null;
+        var neonSeenLyric = -2;
+        var neonLastDraw = 0;
+        var lastEffectiveBg = "";
         var fireHeat: { [k: string]: number } = {};  // fire heat field
         var eqBars: number[] = [];   // equaliser bar heights (per column)
         var eqPeaks: number[] = [];  // equaliser peak-hold caps
@@ -1923,8 +2094,10 @@ namespace FLPlayer {
         var lyrics: LyricLine[] = hasTimedLyrics
             ? track.lyrics
             : distributeLyrics(track.flatLyrics || "", totalSec);
-        if (lyrics.length)
+        if (lyrics.length) {
             AUTO_EFFECTS.push("lyrics");   // rain the vocals -- only on tracks that have them
+            AUTO_EFFECTS.push("neon");     // giant TDF phrase punctuation
+        }
         // Size the lyric strip to this track's longest line so a wide terminal
         // shows full lines instead of ellipsis. Per track (stable across lines),
         // never narrower than the box; the glow/viz bars keep the box width.
@@ -1968,6 +2141,8 @@ namespace FLPlayer {
             rings = [];
             stars = []; lyricDrops = []; fireHeat = {};   // positions were screen-relative
             eqBars = []; eqPeaks = [];
+            neonSign = null;
+            neonSeenLyric = -2;
             wipeActive = false;
             redrawAll();
         }
@@ -2291,11 +2466,40 @@ namespace FLPlayer {
                 var bg = BG_MODES[bgMode];
                 if (bg === "auto")
                     bg = AUTO_EFFECTS[autoIdx];    // rotated by the music above
+                if (lastEffectiveBg === "neon" && bg !== "neon") {
+                    // Neon owns the full art zone, unlike margin effects.
+                    // Restore the album art as soon as another effect takes over.
+                    neonSign = null;
+                    drawArt(blit);
+                    drawSprites(sprites, l, blit, true);
+                }
+                lastEffectiveBg = bg;
                 var bgPainted = false;
                 var fxCx = Math.floor(l.cols / 2);                         // effect centre (tunnel/starfield)
                 var fxCy = Math.floor((l.artTop + l.artBottom) / 2);
                 var STAR_COUNT = Math.max(40, Math.min(120, Math.floor(l.cols * l.rows / 45)));
-                if (margins.length && BG_MODES[bgMode] !== "off" && !paused) {
+                if (bg === "neon" && !paused) {
+                    fieldTick++;
+                    var fxLyricIdx = lyricIndexFor(lyrics, playMs / 1000, lyricIdx);
+                    if (!neonSign && fxLyricIdx >= 0 && lyrics[fxLyricIdx]) {
+                        neonSign = makeNeonSign(lyrics[fxLyricIdx].text, l.cols,
+                            l.artBottom - l.artTop + 1, now);
+                        neonSeenLyric = fxLyricIdx;
+                    } else if (fxLyricIdx !== neonSeenLyric) {
+                        neonSeenLyric = fxLyricIdx;
+                        // Do not throw every line at the wall. A new sign is a
+                        // punctuation hit, spaced far enough apart to read.
+                        if (fxLyricIdx >= 0 && lyrics[fxLyricIdx] && neonSign &&
+                            now - neonSign.born > 4200 && Math.random() < 0.55)
+                            neonSign = makeNeonSign(lyrics[fxLyricIdx].text, l.cols,
+                                l.artBottom - l.artTop + 1, now) || neonSign;
+                    }
+                    if (neonSign && (now - neonLastDraw > 260 || beat)) {
+                        drawNeonSign(neonSign, l, now, beat, hardBeat);
+                        neonLastDraw = now;
+                        bgPainted = true;
+                    }
+                } else if (margins.length && BG_MODES[bgMode] !== "off" && !paused) {
                     fieldTick++;
                     if ((BG_MODES[bgMode] === "auto" || BG_MODES[bgMode] === "strobe") && hardBeat)
                         strobeLevel = 3;
@@ -2406,7 +2610,10 @@ namespace FLPlayer {
                 drawGlow(l, l.glowRow2, paused ? 0 : features.rms, features.zcr, glowOn);
 
                 // Floating avatars: physics every tick, redraw when they move.
-                if (sprites.length && !paused) {
+                // Neon owns the whole art zone and is its own backing store;
+                // pause sprites so their art-restoration trails do not punch
+                // rectangular holes through the sign.
+                if (sprites.length && !paused && bg !== "neon") {
                     var activeSpriteMode = SPRITE_MODES[spriteMode];
                     if (lyrics.length) {
                         // Untimed lyrics cannot expose trustworthy breaks, so
@@ -2563,6 +2770,16 @@ namespace FLPlayer {
         var av = FLAnsiGrid.renderBin(bin, 10, 6);
         if (!av || av.height !== 6 || (av.rows[0][0] & 0xff) !== 65)
             throw new Error("renderBin failed");
+
+        // TDF neon path: load a real TheDraw font, measure it, and convert its
+        // glyph cells without touching the terminal.
+        neonTdf = load({}, "tdfonts_lib.js");
+        neonTdf.opt = { ansi: true, utf8: false, random: false,
+            fontdir: system.ctrl_dir + "tdfonts/" };
+        var testFont = neonTdf.loadfont(system.ctrl_dir + "tdfonts/tiny.tdf");
+        var testNeon = neonGrid("NEON", testFont);
+        if (!testNeon || testNeon.width < 4 || testNeon.height < 1)
+            throw new Error("TDF neon grid failed");
 
         // Key normalization: every arrow representation -> the cursor code.
         var nk: [string, string][] = [
