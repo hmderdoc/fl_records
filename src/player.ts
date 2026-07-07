@@ -93,6 +93,7 @@ namespace FLPlayer {
         lyrics?: LyricLine[];   // timestamped (SYLT or .lrc); preferred
         flatLyrics?: string;    // untimed fallback, distributed over duration
         avatars?: string[];     // raw 10x6 BIN blobs (decoded), up to 2
+        moshAvatars?: string[]; // additional queue-wide guests, used only by the mosh pit
         queueName?: string;     // playlist name when the queue IS a playlist ("" = radio/browse)
         queuePos?: number;      // 1-based position of this track in the queue
         queueLen?: number;      // queue length (for the "3/12" indicator)
@@ -649,6 +650,18 @@ namespace FLPlayer {
         while (i + 1 < lyrics.length && lyrics[i + 1].time <= sec)
             i++;
         return i;
+    }
+
+    // Timestamped formats identify line starts, not line ends. Estimate a
+    // conservative vocal window from the text length, capped before the next
+    // line, so a long timestamp gap becomes an instrumental break.
+    function lyricVocalActive(lyrics: LyricLine[], sec: number, idx: number): boolean {
+        if (idx < 0 || !lyrics[idx]) return false;
+        var words = lyrics[idx].text.replace(/^\s+|\s+$/g, "").split(/\s+/).length;
+        var duration = clamp(1.4 + words * 0.38, 2.2, 6.5);
+        var end = lyrics[idx].time + duration;
+        if (idx + 1 < lyrics.length) end = Math.min(end, lyrics[idx + 1].time);
+        return sec < end;
     }
 
     /** Distribute untimed lyric text evenly across the song duration. */
@@ -1487,18 +1500,25 @@ namespace FLPlayer {
         glitch: number;   // glitch-out frames remaining (hard accents)
         wiggle: number;   // head-shake frames remaining (alternating +-1 col)
         pad: number;      // horizontal spill of the last draw (glitch/wiggle)
+        guest: boolean;   // queue-wide guest: enters for mosh, leaves afterward
+        active: boolean;
+        exiting: boolean;
+        targetX: number;
+        targetY: number;
+        targetTicks: number;
     }
 
     var TRAIL_COLORS = ["0;35", "0;34", "0;36", "0;31", "0;32", "1;30"];
 
     function makeSprites(track: PlayableTrack, l: Layout): Sprite[] {
         var sprites: Sprite[] = [];
-        var blobs = track.avatars || [];
+        var residents = track.avatars || [];
+        var blobs = residents.concat(track.moshAvatars || []);
         var zoneW = l.cols;
         var zoneH = l.artBottom - l.artTop + 1;
         if (zoneW < AVATAR_W + 4 || zoneH < AVATAR_H + 2)
             return sprites;
-        var count = Math.min(blobs.length, 4);
+        var count = Math.min(blobs.length, 14);
         for (var i = 0; i < count; i++) {
             var grid = FLAnsiGrid.renderBin(blobs[i], AVATAR_W, AVATAR_H);
             if (!grid)
@@ -1507,6 +1527,7 @@ namespace FLPlayer {
             // doesn't spawn stacked.
             var span = Math.max(1, zoneW - AVATAR_W - 4);
             var sx = 3 + (count > 1 ? Math.floor(span * i / (count - 1)) : Math.floor(span / 2));
+            var guest = i >= residents.length;
             sprites.push({
                 grid: grid,
                 flipped: FLAnsiGrid.mirror(grid),
@@ -1521,7 +1542,13 @@ namespace FLPlayer {
                 flash: 0,
                 glitch: 0,
                 wiggle: 0,
-                pad: 0
+                pad: 0,
+                guest: guest,
+                active: !guest,
+                exiting: false,
+                targetX: sx,
+                targetY: l.artTop + Math.floor(zoneH / 2),
+                targetTicks: 0
             });
         }
         return sprites;
@@ -1533,7 +1560,7 @@ namespace FLPlayer {
     var SPRITE_MODES = ["float", "gravity", "mosh"];
 
     function stepSprites(sprites: Sprite[], l: Layout, rms: number, beat: boolean,
-        hardBeat: boolean, mode: string): void {
+        hardBeat: boolean, mode: string, modeChanged: boolean): void {
         var minX = 1;
         var maxX = l.cols - AVATAR_W + 1;
         var minY = l.artTop;
@@ -1545,8 +1572,39 @@ namespace FLPlayer {
         var ccy = (minY + maxY) / 2;
         var i: number;
 
+        // Guests arrive from random edges when the pit opens. When it closes,
+        // give each one a different exit vector and keep animating it until it
+        // has cleared the art zone.
+        if (modeChanged) {
+            for (i = 0; i < sprites.length; i++) {
+                var trans = sprites[i];
+                if (!trans.guest) continue;
+                if (mode === "mosh") {
+                    var edge = Math.floor(Math.random() * 4);
+                    trans.x = edge === 0 ? minX : (edge === 1 ? maxX : minX + Math.random() * (maxX - minX));
+                    trans.y = edge === 2 ? minY : (edge === 3 ? maxY : minY + Math.random() * (maxY - minY));
+                    trans.vx = (ccx - trans.x) * 0.045;
+                    trans.vy = (ccy - trans.y) * 0.045;
+                    trans.active = true; trans.exiting = false; trans.targetTicks = 0;
+                } else if (trans.active) {
+                    var outEdge = Math.floor(Math.random() * 4);
+                    trans.exiting = true;
+                    trans.vx = outEdge === 0 ? -2.4 : (outEdge === 1 ? 2.4 : (Math.random() - 0.5) * 1.5);
+                    trans.vy = outEdge === 2 ? -1.9 : (outEdge === 3 ? 1.9 : (Math.random() - 0.5) * 1.2);
+                }
+            }
+        }
+
         for (i = 0; i < sprites.length; i++) {
             var s = sprites[i];
+            if (!s.active) continue;
+            if (s.guest && s.exiting) {
+                s.x += s.vx * speed; s.y += s.vy * speed;
+                s.vx *= 1.035; s.vy *= 1.035;
+                if (s.x < minX || s.x > maxX || s.y < minY || s.y > maxY)
+                    s.active = false;
+                continue;
+            }
             if (beat) s.flash = 3;                          // palette strobe
             if (hardBeat) s.glitch = 3;                     // glitch-out on hard accents
             else if (beat && s.wiggle === 0 && Math.random() < 0.35) s.wiggle = 4;
@@ -1563,13 +1621,45 @@ namespace FLPlayer {
                 if (s.y > maxY) { s.y = maxY; s.vy = -Math.abs(s.vy) * 0.55; s.vx *= 0.92; hit = true; }  // floor
                 if (s.y < minY) { s.y = minY; s.vy = Math.abs(s.vy) * 0.5; hit = true; }
             } else if (mode === "mosh") {
-                if (beat) {                                 // explode outward from the centre
+                // Guests charge changing targets in the central pit. The
+                // current track's performers stay around its perimeter and do
+                // an independent solo slam-dance instead of joining the clump.
+                if (s.targetTicks-- <= 0 || beat) {
+                    if (s.guest) {
+                        s.targetX = ccx + (Math.random() - 0.5) * Math.max(8, (maxX - minX) * 0.48);
+                        s.targetY = ccy + (Math.random() - 0.5) * Math.max(3, (maxY - minY) * 0.42);
+                        s.targetTicks = 7 + Math.floor(Math.random() * 16);
+                    } else {
+                        // Pick one of four loose perimeter stages. Offsetting
+                        // each resident keeps co-performers from stacking.
+                        var side = (i + Math.floor(Math.random() * 4)) % 4;
+                        s.targetX = side === 0 ? minX + 2 : (side === 1 ? maxX - 2 :
+                            minX + (0.15 + Math.random() * 0.7) * (maxX - minX));
+                        s.targetY = side === 2 ? minY + 1 : (side === 3 ? maxY - 1 :
+                            minY + (0.12 + Math.random() * 0.76) * (maxY - minY));
+                        s.targetTicks = 16 + Math.floor(Math.random() * 24);
+                    }
+                }
+                if (beat && s.guest) {                      // pit explodes out from the centre
                     var ang = Math.atan2(s.y - ccy, s.x - ccx);
                     s.vx += Math.cos(ang) * (1.6 + rms * 2.2);
                     s.vy += Math.sin(ang) * (1.3 + rms * 1.7);
-                } else {                                    // otherwise get pulled back in
-                    s.vx += (ccx - s.x) * 0.022;
-                    s.vy += (ccy - s.y) * 0.022;
+                } else if (s.guest) {                       // charge a changing pit target
+                    s.vx += (s.targetX - s.x) * 0.035;
+                    s.vy += (s.targetY - s.y) * 0.035;
+                } else {
+                    // Solo performers hold a peripheral spot, but hit every
+                    // beat with short, uncorrelated horizontal/vertical slams.
+                    s.vx += (s.targetX - s.x) * 0.055;
+                    s.vy += (s.targetY - s.y) * 0.055;
+                    if (beat) {
+                        s.vx += (Math.random() < 0.5 ? -1 : 1) * (1.0 + rms * 1.8);
+                        s.vy += (Math.random() - 0.5) * (1.1 + rms * 1.4);
+                        s.wiggle = Math.max(s.wiggle, hardBeat ? 7 : 5);
+                    } else {
+                        s.vx += (Math.random() - 0.5) * 0.16;
+                        s.vy += (Math.random() - 0.5) * 0.10;
+                    }
                 }
                 s.vx = clamp(s.vx, -2.1, 2.1);
                 s.vy = clamp(s.vy, -1.7, 1.7);
@@ -1602,6 +1692,10 @@ namespace FLPlayer {
         for (var j = i + 1; j < sprites.length; j++) {
             var a = sprites[i];
             var b = sprites[j];
+            if (!a.active || !b.active || a.exiting || b.exiting) continue;
+            // During mosh mode, only crowd members collide in the pit. The
+            // featured performers retain their independent perimeter stages.
+            if (mode === "mosh" && (!a.guest || !b.guest)) continue;
             if (Math.abs(a.x - b.x) < AVATAR_W && Math.abs(a.y - b.y) < AVATAR_H) {
                 var tvx = a.vx; a.vx = b.vx; b.vx = tvx;
                 var tvy = a.vy; a.vy = b.vy; b.vy = tvy;
@@ -1616,6 +1710,13 @@ namespace FLPlayer {
     function drawSprites(sprites: Sprite[], l: Layout, blit: ArtBlit, force: boolean): void {
         for (var i = 0; i < sprites.length; i++) {
             var s = sprites[i];
+            if (!s.active) {
+                if (s.drawnX >= 0)
+                    restoreRect(blit, l, s.drawnX - s.pad, s.drawnY,
+                        AVATAR_W + s.pad * 2, AVATAR_H);
+                s.drawnX = -1; s.drawnY = -1; s.pad = 0;
+                continue;
+            }
             var nx = Math.round(s.x);
             var ny = Math.round(s.y);
             var moved = nx !== s.drawnX || ny !== s.drawnY;
@@ -1771,6 +1872,10 @@ namespace FLPlayer {
         var secBaseZcr = 0;
         var lastFeatChunk = -1;
         var spriteMode = 0;          // avatar motion mode, rotates with the effect
+        var lastSpriteMode = SPRITE_MODES[spriteMode];
+        var vocalsSeen = false;      // mosh is premature before the first sung line
+        var moshLatched = false;     // once the crowd enters, stay until vocals resume
+        var MIN_MOSH_BREAK_SEC = 8;  // leave enough time for entrance, pit, and exit
         var AUTO_EFFECTS = ["checker", "plasma", "ripple", "tunnel", "starfield", "fire", "equalizer", "spiral", "aurora", "sweep"];
         // "lyrics" (lyric rain) is appended to the pool below, but only when the
         // track actually has lyrics -- so instrumental tracks never rotate to it.
@@ -1814,7 +1919,8 @@ namespace FLPlayer {
             if (cells > 0 && chroma / cells < 0.15)
                 PALETTE_SEQ = SEQ_GRAYSCALE;
         }
-        var lyrics: LyricLine[] = track.lyrics && track.lyrics.length
+        var hasTimedLyrics = !!(track.lyrics && track.lyrics.length);
+        var lyrics: LyricLine[] = hasTimedLyrics
             ? track.lyrics
             : distributeLyrics(track.flatLyrics || "", totalSec);
         if (lyrics.length)
@@ -2301,7 +2407,33 @@ namespace FLPlayer {
 
                 // Floating avatars: physics every tick, redraw when they move.
                 if (sprites.length && !paused) {
-                    stepSprites(sprites, l, features.rms, beat, hardBeat, SPRITE_MODES[spriteMode]);
+                    var activeSpriteMode = SPRITE_MODES[spriteMode];
+                    if (lyrics.length) {
+                        // Untimed lyrics cannot expose trustworthy breaks, so
+                        // they never mosh. Timed lyrics turn mosh into a latched
+                        // break event: never before the first vocal, only when
+                        // enough break remains for the entrance choreography,
+                        // then continuously until the next vocal begins.
+                        var spriteLyricIdx = lyricIndexFor(lyrics, playMs / 1000, lyricIdx);
+                        var vocalsActive = !hasTimedLyrics ||
+                            lyricVocalActive(lyrics, playMs / 1000, spriteLyricIdx);
+                        if (hasTimedLyrics && vocalsActive) vocalsSeen = true;
+                        if (vocalsActive) {
+                            moshLatched = false;
+                        } else if (hasTimedLyrics && vocalsSeen && activeSpriteMode === "mosh") {
+                            var nextVocalAt = spriteLyricIdx + 1 < lyrics.length
+                                ? lyrics[spriteLyricIdx + 1].time : totalSec;
+                            if (nextVocalAt - playMs / 1000 >= MIN_MOSH_BREAK_SEC)
+                                moshLatched = true;
+                        }
+                        if (moshLatched && !vocalsActive)
+                            activeSpriteMode = "mosh";
+                        else if (activeSpriteMode === "mosh")
+                            activeSpriteMode = "gravity";
+                    }
+                    stepSprites(sprites, l, features.rms, beat, hardBeat,
+                        activeSpriteMode, activeSpriteMode !== lastSpriteMode);
+                    lastSpriteMode = activeSpriteMode;
                     drawSprites(sprites, l, blit, false);
                 }
 
@@ -2342,7 +2474,12 @@ namespace FLPlayer {
             }
         }
 
-        apc("A;Flush;C=" + CHANNEL + ";O=250");
+        // Track/UI transitions must be sample-discontinuous: SyncTERM defines
+        // O= as an asynchronous fade of the current head buffer, so returning
+        // while a Flush;O=250 is still sounding lets the caller draw (and start
+        // timing) the next track over the previous track's tail.  A bare Flush
+        // drains the FIFO and stops the head immediately.
+        apc("A;Flush;C=" + CHANNEL);
         console.write("\x1b[?25h");   // cursor back for the menus
         dbg("playLoop exit: result=" + result);
         return result;

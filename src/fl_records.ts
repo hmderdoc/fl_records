@@ -1279,6 +1279,7 @@ interface AppState {
     // web records page uses): base64 10x6 BIN between avatar_data markers in
     // each persona's thread-origin message body. Cached per session.
     var cowriterAvatarCache: { [name: string]: string } | null = null;
+    var trackAvatarCache: { [key: string]: string[] } = {};
 
     function cowriterAvatars(): { [name: string]: string } {
         if (cowriterAvatarCache !== null) return cowriterAvatarCache;
@@ -1327,6 +1328,8 @@ interface AppState {
     // Resolve up to two 10x6 avatar BIN blobs for a track: split the artist
     // on feat./separators, then try AI co-writers, then local BBS users.
     function trackAvatars(track: TrackSummary): string[] {
+        var cacheKey = track.name + ":" + track.size + ":" + track.mtime;
+        if (trackAvatarCache[cacheKey]) return trackAvatarCache[cacheKey].slice(0);
         var out: string[] = [];
         var names: string[] = [];
         var raw = trimValue(displayTrackArtist(track));
@@ -1363,6 +1366,27 @@ interface AppState {
                 var bin = base64_decode(data.replace(/[\r\n\s]/g, ""));
                 if (bin.length >= 120)
                     out.push(bin);
+            }
+        }
+        trackAvatarCache[cacheKey] = out.slice(0);
+        return out;
+    }
+
+    // Build a varied crowd from the other songs in the current radio/playlist
+    // queue. The active track's performers remain residents; these avatars are
+    // dormant until the mosh-pit motion mode begins.
+    function queueMoshAvatars(list: TrackSummary[], current: TrackSummary, residents: string[]): string[] {
+        var out: string[] = [];
+        var seen: { [data: string]: boolean } = {};
+        for (var r = 0; r < residents.length; r++) seen[residents[r]] = true;
+        if (!list.length) return out;
+        var start = Math.floor(Math.random() * list.length);
+        for (var n = 0; n < list.length && out.length < 10; n++) {
+            var candidate = list[(start + n) % list.length];
+            if (candidate.name === current.name) continue;
+            var found = trackAvatars(candidate);
+            for (var a = 0; a < found.length && out.length < 10; a++) {
+                if (!seen[found[a]]) { seen[found[a]] = true; out.push(found[a]); }
             }
         }
         return out;
@@ -1425,6 +1449,7 @@ interface AppState {
                 }
                 var flat = timed.length ? "" :
                     toScreenText(trimValue(parsed.lyricsText || loadSidecarLyrics(cur)));
+                var residentAvatars = trackAvatars(cur);
                 var playable: FLPlayer.PlayableTrack = {
                     path: cur.path,
                     name: cur.name,
@@ -1435,7 +1460,8 @@ interface AppState {
                     ansiArt: parsed.ansiArtBase64.length ? base64_decode(parsed.ansiArtBase64) : "",
                     lyrics: timed,
                     flatLyrics: flat,
-                    avatars: trackAvatars(cur),
+                    avatars: residentAvatars,
+                    moshAvatars: queueMoshAvatars(curList, cur, residentAvatars),
                     queueName: currentPlaylist,     // "" for radio/browse -> no count shown
                     // Shuffle: how far into the current shuffle (1..len). Sequential:
                     // the track's position in the arranged list.
@@ -1502,9 +1528,9 @@ interface AppState {
                 if (outcome === "create") {
                     // Compose is a uifc flow, and the shim reads via
                     // console.getkey which (unlike the pump) does NOT swallow
-                    // APC replies. The player's exit flush fades ~250ms then
-                    // emits a drain notify whose ESC would dismiss the menu the
-                    // instant it opens -- so drain past it here before uifc.
+                    // APC replies. The player's exit Flush can emit a drain
+                    // notify whose ESC would dismiss the menu the instant it
+                    // opens, so drain it here before uifc.
                     console.clear();
                     console.writeln("");
                     console.writeln("  Opening composer...");
@@ -1766,9 +1792,9 @@ interface AppState {
     // draining any APC reply tail first (the shim's getkey doesn't swallow it,
     // so a stray drain-notify would dismiss the menu). Restores prior UI state.
     function runUifcFlow(fn: () => void): void {
-        // 450ms: enough to swallow the player's exit-flush fade (O=250) + its
-        // drain notify, whose ESC would otherwise dismiss the shim menu (the
-        // uifc shim's getkey, unlike the pump, doesn't filter APC replies).
+        // Swallow the player's exit-Flush drain notify, whose ESC would
+        // otherwise dismiss the shim menu; unlike the pump, the uifc shim's
+        // getkey does not filter APC replies.
         FLPlayer.pumpShared(450);
         var hadUi = uiReady;
         if (!hadUi) initUi();
