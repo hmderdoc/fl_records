@@ -1915,11 +1915,12 @@ namespace FLPlayer {
         }
     }
 
-    function drawSprites(sprites: Sprite[], l: Layout, blit: ArtBlit, force: boolean): void {
+    function drawSprites(sprites: Sprite[], l: Layout, blit: ArtBlit, force: boolean,
+        backdropRepainted?: boolean): void {
         for (var i = 0; i < sprites.length; i++) {
             var s = sprites[i];
             if (!s.active) {
-                if (s.drawnX >= 0)
+                if (s.drawnX >= 0 && !backdropRepainted)
                     restoreRect(blit, l, s.drawnX - s.pad, s.drawnY,
                         AVATAR_W + s.pad * 2, AVATAR_H);
                 s.drawnX = -1; s.drawnY = -1; s.pad = 0;
@@ -1929,9 +1930,9 @@ namespace FLPlayer {
             var ny = Math.round(s.y);
             var moved = nx !== s.drawnX || ny !== s.drawnY;
             var animating = s.flash > 0 || s.glitch > 0 || s.wiggle > 0 || s.pad > 0;
-            if (!force && !moved && !animating)
+            if (!force && !backdropRepainted && !moved && !animating)
                 continue;
-            if (s.drawnX >= 0 && (moved || s.pad > 0)) {
+            if (s.drawnX >= 0 && (moved || s.pad > 0) && !backdropRepainted) {
                 // Erase the previous frame (expanded by any glitch spill).
                 // Moving leaves a colored wake; in-place redraws restore clean.
                 restoreRect(blit, l, s.drawnX - s.pad, s.drawnY,
@@ -2096,7 +2097,6 @@ namespace FLPlayer {
         var neonSign: NeonSign | null = null;
         var neonNextSign: NeonSign | null = null;
         var neonSeenLyric = -2;
-        var neonLastDraw = 0;
         var neonTransitionAt = 0;
         var neonOutFx = 0;
         var neonInFx = 0;
@@ -2551,7 +2551,7 @@ namespace FLPlayer {
                             }
                         }
                     }
-                    if (neonSign && (now - neonLastDraw > 180 || beat)) {
+                    if (neonSign) {
                         if (neonNextSign && neonTransitionAt > 0) {
                             var transP = clamp((now - neonTransitionAt) / NEON_TRANSITION_MS, 0, 1);
                             // Sequential halves keep the full-zone backing
@@ -2571,7 +2571,6 @@ namespace FLPlayer {
                         } else {
                             drawNeonSign(neonSign, l, now, beat, hardBeat);
                         }
-                        neonLastDraw = now;
                         bgPainted = true;
                     }
                 } else if (margins.length && BG_MODES[bgMode] !== "off" && !paused) {
@@ -2685,10 +2684,10 @@ namespace FLPlayer {
                 drawGlow(l, l.glowRow2, paused ? 0 : features.rms, features.zcr, glowOn);
 
                 // Floating avatars: physics every tick, redraw when they move.
-                // Neon owns the whole art zone and is its own backing store;
-                // pause sprites so their art-restoration trails do not punch
-                // rectangular holes through the sign.
-                if (sprites.length && !paused && bg !== "neon") {
+                // Neon repaints the complete art zone every frame, so it has
+                // already erased prior sprite positions; skip album-art restore
+                // in that case and draw the avatars over the fresh sign.
+                if (sprites.length && !paused) {
                     var activeSpriteMode = SPRITE_MODES[spriteMode];
                     if (lyrics.length) {
                         // Untimed lyrics cannot expose trustworthy breaks, so
@@ -2716,7 +2715,7 @@ namespace FLPlayer {
                     stepSprites(sprites, l, features.rms, beat, hardBeat,
                         activeSpriteMode, activeSpriteMode !== lastSpriteMode);
                     lastSpriteMode = activeSpriteMode;
-                    drawSprites(sprites, l, blit, false);
+                    drawSprites(sprites, l, blit, false, bg === "neon" && bgPainted);
                 }
 
                 // Synced lyric line between the strips: a new line launches a
