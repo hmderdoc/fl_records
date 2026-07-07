@@ -1623,6 +1623,11 @@ namespace FLPlayer {
         var reveal = clamp(age / (850 + sign.style * 90), 0, 1);
         var ox = Math.floor((l.cols - sign.width) / 2);
         var oy = Math.floor((zoneH - sign.height) / 2);
+        // Fast geometric distortion is pulsed, never continuous: roughly one
+        // second of smoothly enveloped motion followed by several seconds of
+        // stable readability.
+        var wiggleCycle = age % 3800;
+        var wigglePulse = wiggleCycle < 950 ? Math.sin(Math.PI * wiggleCycle / 950) : 0;
         if (sign.style === 1) { // slow horizontal sign-pan, entering from one side
             var enter = clamp(age / 1200, 0, 1);
             ox += Math.round(sign.direction * ((1 - enter) * l.cols + Math.sin(age / 850) * 4));
@@ -1632,7 +1637,7 @@ namespace FLPlayer {
         if (sign.style === 0) // compact beat-sign bounce
             oy -= Math.round(Math.abs(Math.sin(age / 240)) * 2);
         else if (sign.style === 3) // nervous neon-tube wiggle
-            ox += Math.round(Math.sin(age / 115) * 2);
+            ox += Math.round(Math.sin(age / 115) * 2 * wigglePulse);
         // Transition geometry is independent of the sign's idle animation.
         // Each lyric therefore gets one of many entrances and a separately
         // selected departure rather than repeating one canned cross-fade.
@@ -1663,7 +1668,7 @@ namespace FLPlayer {
                     blastShift = Math.round((gy - sign.height / 2) * blastForce * sign.direction * 1.4);
                 }
                 if (tk < 0 && sign.style === 4)
-                    blastShift += Math.round(Math.sin(age / 135 + gy * 1.7) * 2);
+                    blastShift += Math.round(Math.sin(age / 135 + gy * 1.7) * 2 * wigglePulse);
                 var gx = sx - ox - blastShift;
                 var packed = gy >= 0 && gy < sign.height && gx >= 0 && gx < sign.width
                     ? sign.rows[gy][gx] : 0;
