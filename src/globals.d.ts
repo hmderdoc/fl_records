@@ -8,6 +8,7 @@ declare var bbs: {
     online: boolean;
     sys_status: number;
     command_str: string;
+    mods: { [key: string]: any };
 };
 declare var system: {
     mods_dir: string;
@@ -172,6 +173,7 @@ declare function log(level: number, message: string): void;
 declare function file_exists(path: string): boolean;
 declare function file_size(path: string): number;
 declare function file_date(path: string): number;
+declare function file_getname(path: string): string;
 declare function fullpath(path: string): string;
 declare function backslash(path: string): string;
 declare function directory(pattern: string): string[];

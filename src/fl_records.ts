@@ -2879,12 +2879,56 @@ interface AppState {
         writeln("shuffle self-test: OK");
     }
 
+    /** One-track entry point staged by fshell's File Areas MP3 preview. */
+    function stagedPreviewPath(): string {
+        var key = "fshell_file_preview_audio";
+        var request: any = bbs && bbs.mods ? bbs.mods[key] : null;
+        try { if (bbs && bbs.mods) delete bbs.mods[key]; } catch (_) { }
+        var path = request && typeof request.path === "string" ? request.path : "";
+        if (!path || !/\.mp3$/i.test(path) || !file_exists(path)) return "";
+        return path;
+    }
+
+    function previewTrack(path: string): void {
+        console.clear();
+        console.writeln("");
+        console.writeln("  Preparing " + file_getname(path) + "...");
+        if (FLPlayer.detectSink() === "none") {
+            console.writeln("");
+            console.writeln("  No SyncTERM/APC audio sink was detected.");
+            console.pause();
+            return;
+        }
+        FLPlayer.shuffle = false;
+        FLPlayer.playTrack({
+            path: path,
+            name: file_getname(path),
+            title: file_getname(path).replace(/\.mp3$/i, ""),
+            artist: "",
+            size: file_size(path),
+            mtime: file_date(path),
+            ansiArt: "",
+            queueName: "File Preview",
+            queuePos: 1,
+            queueLen: 1
+        });
+        // The final APC Flush can answer after playTrack returns. Keep the
+        // sequence-aware pump alive briefly so its ESC/CSI bytes cannot escape
+        // into fshell and become a phantom Back action.
+        FLPlayer.pumpShared(250);
+    }
+
     function main(): void {
         if (typeof argv !== "undefined" && argv && argv.indexOf("--selftest") >= 0) {
             sanitizerSelfTest();
             playlistSelfTest();
             shuffleSelfTest();
             FLPlayer.selfTest();
+            return;
+        }
+        var previewPath = stagedPreviewPath();
+        if (previewPath) {
+            previewTrack(previewPath);
             return;
         }
         var app = createAppState();
