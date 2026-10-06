@@ -51,6 +51,10 @@ namespace FLPlayer {
     load("sbbsdefs.js");
 
     // ---- tuning -------------------------------------------------------
+    // These are the DESKTOP profile (SyncTERM/BBSproxy on a real computer).
+    // They are `var`, not const, because detectSink() re-points them at the
+    // low-bandwidth profile when the caller turns out to be a 3dBBS handheld
+    // — see apply3dbbsProfile() for why that terminal needs its own set.
     var CHUNK_MS = 300;          // clip length; also the pacing quantum
     var PREBUFFER = 3;           // chunks queued ahead of realtime
     var CHANNEL = 2;             // first APC-dedicated channel (0/1 are cterm's)
@@ -99,7 +103,7 @@ namespace FLPlayer {
         queueLen?: number;      // queue length (for the "3/12" indicator)
     }
 
-    export type PlayResult = "quit" | "next" | "prev" | "ended" | "error" | "browse" | "create" | "addplaylist" | "removeplaylist";
+    export type PlayResult = "quit" | "next" | "prev" | "ended" | "error" | "browse" | "create" | "addplaylist" | "removeplaylist" | "top";
 
     // Track-shuffle toggle (S key). playInTerminal reads this when advancing:
     // on -> next track is random from the queue, off -> sequential. Shared here
@@ -109,6 +113,11 @@ namespace FLPlayer {
     // it on the next advance to start a BRAND-NEW shuffle from position 1, rather
     // than resuming the old deck -- so shuffle->off->on gives a fresh shuffle.
     export var shuffleReset = false;
+    // Set by playLoop on exit: how far into the track the listener got (ms)
+    // and the track's length (s). playInTerminal turns these into a play
+    // count via the shared store's 30-second rule.
+    export var lastPlayMs = 0;
+    export var lastTotalSec = 0;
 
     // ---- small helpers --------------------------------------------------
     function shellQuote(s: string): string {
@@ -260,6 +269,7 @@ namespace FLPlayer {
         esc: boolean;         // lone ESC key
         audio: number[][];    // [id, state] pairs from CSI =7;...n reports
         cpr: number[][];      // [rows, cols] cursor-position reports (size probe)
+        apc: string[];        // APC string bodies (ESC _ ... ST), e.g. 3DS:Ver
         other: string[];      // CSI sequences we do not handle (diagnostics)
     }
 
@@ -279,7 +289,7 @@ namespace FLPlayer {
 
         /** Poll for up to maxMs, decoding everything that arrives. */
         pump(maxMs: number): PumpResult {
-            var res: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+            var res: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
             var deadline = nowMs() + maxMs;
             do {
                 var k = console.inkey(K_NONE, 10);
@@ -379,6 +389,24 @@ namespace FLPlayer {
                     }
                     // ESC O <other>: not an arrow, fall through to Esc handling.
                 }
+                // APC string (ESC _ ... ST) — where the 3dBBS capability reply
+                // lands. Without this branch the ESC fell through below as the
+                // quit key and the body arrived as plain keystrokes: probing a
+                // 3DS would have answered "3DS:Ver;0;3" and handed the player a
+                // phantom S (shuffle), V (volume) and R (restart) on the way
+                // out. Wait for the ST terminator; an unterminated body ages
+                // out rather than wedging the buffer.
+                if (this.buf.charAt(1) === "_") {
+                    var stAt = this.buf.indexOf("\x1b\\", 2);
+                    if (stAt < 0) {
+                        if (idle && this.buf.length > 512)
+                            this.buf = "";     // malformed: don't wedge
+                        return;                // incomplete APC: wait for ST
+                    }
+                    res.apc.push(this.buf.substring(2, stAt));
+                    this.buf = this.buf.substr(stAt + 2);
+                    continue;
+                }
                 if (this.buf.charAt(1) !== "[") {
                     res.esc = true;       // ESC + non-CSI: treat as Esc, re-scan rest
                     this.buf = this.buf.substr(1);
@@ -448,6 +476,8 @@ namespace FLPlayer {
             bits.push("audio=" + ev.audio[i][0] + ":" + ev.audio[i][1]);
         for (var c = 0; c < ev.cpr.length; c++)
             bits.push("cpr=" + ev.cpr[c][0] + "x" + ev.cpr[c][1]);
+        for (var p = 0; p < ev.apc.length; p++)
+            bits.push("apc=" + ev.apc[p]);
         for (var o = 0; o < ev.other.length; o++)
             bits.push("other=^" + ev.other[o]);
         return bits.join(" ");
@@ -519,10 +549,79 @@ namespace FLPlayer {
         return normalizeKey("\x1b" + seq);
     }
 
+    // ---- 3dBBS (Nintendo 3DS) profile -------------------------------------
+    /**
+     * 3dBBS is a Nintendo 3DS homebrew terminal. It answers Q;libsndfile
+     * truthfully, so the sink probe below classifies it as "syncterm" and —
+     * before this — it was handed the full desktop stream: 22050 Hz stereo
+     * s16 is 88 KB/s of PCM, ~118 KB/s once base64'd into APC frames.
+     *
+     * That is more than the handheld can physically consume. 3dBBS drains its
+     * 256 KB socket ring through exactly ONE 8192-byte parse per rendered
+     * frame (3dBBS source/main.c: `telnetRead(rxbuf, sizeof rxbuf)`), so its
+     * intake ceiling is 8 KB x fps — and the art wipes spend part of that same
+     * budget, ~13 KB for a full-art frame since every cell changes palette. A
+     * 300 ms desktop chunk is ~35 KB of base64: five frames of parse for one
+     * clip, with the next due every 300 ms, and the track-start burst
+     * (PREBUFFER + 2 chunks) drops ~177 KB into that 256 KB ring at once. The
+     * ring backs up, recv() stops draining, and playback chops — the reported
+     * "glitches out at latency" symptom.
+     *
+     * Two of the three levers are free, because the client discards that data
+     * on arrival anyway:
+     *   - Stereo: 3dBBS decodes "PCM16/U8, mono or stereo -> mono s16"
+     *     (source/audio/apcaudio.c wavDecode) — the second channel is
+     *     downmixed away. Sending it was pure waste.
+     *   - 22050 Hz: resampled again for a handheld speaker.
+     * Mono at 11025 Hz is 22 KB/s of PCM, ~29 KB/s on the wire: a 4x cut that
+     * puts one chunk at ~9 KB (about a single frame's parse) and the start
+     * burst at ~44 KB. The UI cadence eases off as well so beat-driven wipes
+     * stop racing the audio for the same 8 KB.
+     *
+     * The transcode cache key already includes rate x channels, so the two
+     * profiles coexist on disk rather than invalidating each other.
+     */
+    var CTERM_3DBBS = 1332;      // CTerm version 3dBBS reports (matches scene3d.js)
+    var QUERY_3DS = "\x1b_3DS:Query\x1b\\";
+    // Grace after the libsndfile reply to let a 3DS:Ver answer land behind it.
+    // Real SyncTERM reports CTerm 1.332 too (src/conio/cterm.c revision
+    // string), so the version pre-filter cannot tell the two apart and there
+    // is no negative reply to wait on — the probes go out together and this is
+    // the only added cost on a desktop terminal, once per session.
+    var QUERY_3DS_GRACE_MS = 250;
+    var is3dbbsCache = false;
+
+    /** True when the caller is a 3dBBS handheld (valid after detectSink). */
+    export function is3dbbs(): boolean {
+        return is3dbbsCache;
+    }
+
+    /** Worth sending the 3DS probe at all? (see PROTOCOL.md detection ladder) */
+    function may3dbbs(): boolean {
+        try {
+            return typeof console.cterm_version === "number" &&
+                console.cterm_version >= CTERM_3DBBS;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    /** Re-point the streaming/UI tuning at the handheld's intake budget. */
+    function apply3dbbsProfile(): void {
+        PCM_CHANNELS = 1;        // client downmixes to mono regardless
+        PCM_RATE = 11025;        // 4x less wire traffic together with mono
+        UI_TICK_MS = 220;        // leave parse budget for the audio stream
+        dbg("3dBBS profile: " + PCM_RATE + "Hz x" + PCM_CHANNELS +
+            " ui=" + UI_TICK_MS + "ms");
+    }
+
     // ---- sink detection ---------------------------------------------------
     /**
      * Two-stage probe:
      *  1. APC SyncTERM:Q;libsndfile -> CSI =7;100;1 n  => real SyncTERM.
+     *     Sent alongside APC 3DS:Query -> APC 3DS:Ver;maj;min, which only a
+     *     3dBBS handheld answers; both are APC jobs on its FIFO worker, so
+     *     the version reply follows the feature reply closely.
      *  2. Store+Load+Queue a ~60ms silent clip with Update armed; a
      *     CSI =7;<ch>;0 n drain notify => any APC sink (BBSproxy).
      * Cached for the session; pass force=true to redetect.
@@ -533,19 +632,45 @@ namespace FLPlayer {
         var pumpr = sharedPump;
         var found: SinkKind = "none";
 
+        var probing3ds = may3dbbs();
+        is3dbbsCache = false;
         apc("Q;libsndfile");
+        if (probing3ds)
+            console.write(QUERY_3DS);
         var deadline = nowMs() + 700;
+        var graceUntil = 0;      // set once the feature reply lands
         while (nowMs() < deadline) {
             var r = pumpr.pump(50);
             for (var i = 0; i < r.audio.length; i++) {
-                if (r.audio[i][0] === 100 && r.audio[i][1] === 1) {
+                if (r.audio[i][0] === 100 && r.audio[i][1] === 1)
                     found = "syncterm";
-                    break;
+            }
+            for (var a = 0; a < r.apc.length; a++) {
+                if (r.apc[a].substr(0, 8) === "3DS:Ver;") {
+                    is3dbbsCache = true;
+                    dbg("3dBBS detected: " + r.apc[a]);
                 }
             }
-            if (found !== "none")
-                break;
+            if (is3dbbsCache) {
+                // 3dBBS answers Q;libsndfile with 1 by contract (PROTOCOL.md
+                // s4), so a version reply that beat the feature reply into a
+                // separate batch still settles the sink — without this the
+                // probe would fall through to the 1.2s silent-clip fallback.
+                found = "syncterm";
+                break;           // both answers in; nothing left to wait for
+            }
+            if (found !== "none") {
+                if (!probing3ds)
+                    break;
+                if (!graceUntil)
+                    graceUntil = nowMs() + QUERY_3DS_GRACE_MS;
+                else if (nowMs() >= graceUntil)
+                    break;       // desktop terminal: no 3DS reply is coming
+            }
         }
+        // Applied before the silence probe below, which streams at this format.
+        if (is3dbbsCache)
+            apply3dbbsProfile();
 
         if (found === "none") {
             // Silent probe clip: 60ms of zeros at the streaming format.
@@ -582,7 +707,24 @@ namespace FLPlayer {
     }
 
     // ---- per-chunk audio features -----------------------------------------
-    export function chunkFeatures(slice: string, channels: number): { rms: number; raw: number; zcr: number; lo: number; mid: number; hi: number } {
+    // The reference rate the brightness/band constants below were tuned at.
+    // Features must describe the AUDIO, not the sample rate it arrived in, so
+    // the 3dBBS profile's 11025 Hz stream drives the visualizer identically to
+    // a desktop 22050 Hz one.
+    var FEATURE_REF_RATE = 22050;
+
+    export function chunkFeatures(slice: string, channels: number, rate?: number): { rms: number; raw: number; zcr: number; lo: number; mid: number; hi: number } {
+        var featRate = rate && rate > 0 ? rate : FEATURE_REF_RATE;
+        // The two rate corrections below pull in OPPOSITE directions, because
+        // the quantities they fix scale oppositely with the sample rate:
+        //   zcrScale  - crossings are counted PER FRAME, and identical audio
+        //               crosses zero twice as often per frame at half the
+        //               rate, so scale down (0.5 at 11025).
+        //   bandScale - a one-pole's corner is a*rate/2pi, so holding a
+        //               crossover at a fixed FREQUENCY needs a bigger
+        //               coefficient at a lower rate (2.0 at 11025).
+        var zcrScale = featRate / FEATURE_REF_RATE;
+        var bandScale = FEATURE_REF_RATE / featRate;
         var frames = Math.floor(slice.length / (channels * 2));
         if (frames < 2)
             return { rms: 0, raw: 0, zcr: 0, lo: 0, mid: 0, hi: 0 };
@@ -615,6 +757,11 @@ namespace FLPlayer {
         // low-passes split the waveform into lows (<~300Hz) / mids / highs
         // (>~1.3kHz), so the equaliser reacts to real frequency content, not a
         // faked per-bar wobble. lp1/lp2 are the running low-passed signals.
+        // Coefficients scale with bandScale to hold those crossovers at the
+        // same FREQUENCIES on a lower-rate stream (clamped below 1: a one-pole
+        // stops smoothing at all once the coefficient reaches 1).
+        var aLo = clamp(0.08 * bandScale, 0, 0.95);
+        var aMid = clamp(0.34 * bandScale, 0, 0.95);
         var lp1 = 0, lp2 = 0, eLo = 0, eMid = 0, eHi = 0;
         for (var w = 0; w < winFrames; w++) {
             var s = rd16(slice, (start + w) * channels * 2);
@@ -624,13 +771,17 @@ namespace FLPlayer {
                 crossings++;
             prev = s;
             var sn = s / 32768;
-            lp1 += (sn - lp1) * 0.08;              // heavy low-pass  -> bass
-            lp2 += (sn - lp2) * 0.34;              // lighter low-pass -> bass+mid
+            lp1 += (sn - lp1) * aLo;               // heavy low-pass  -> bass
+            lp2 += (sn - lp2) * aMid;              // lighter low-pass -> bass+mid
             var bLo = lp1, bMid = lp2 - lp1, bHi = sn - lp2;
             eLo += bLo * bLo; eMid += bMid * bMid; eHi += bHi * bHi;
         }
         // crossings/frame *at the PCM rate*: ~0.02 = bassy, ~0.25+ = bright.
-        var zcr = clamp((crossings / winFrames) * 5, 0, 1);
+        // Halving the rate doubles crossings-per-frame for identical audio, so
+        // zcrScale converts back to the reference rate before the lift —
+        // otherwise every track reads as "bright" on the handheld and the
+        // section-change detector (dZcr) trips on the shift.
+        var zcr = clamp((crossings / winFrames) * 5 * zcrScale, 0, 1);
         // Band RMS with a per-band perceptual lift (upper bands carry less
         // energy, so they get a bigger multiplier to stay visible on the meter).
         var lo = clamp(Math.sqrt(eLo / winFrames) * 3.6, 0, 1);
@@ -933,6 +1084,7 @@ namespace FLPlayer {
         { keys: ["S"], label: "huffle" },
         { keys: ["A"], label: "dd" },
         { keys: ["B"], label: "rowse" },
+        { keys: ["T"], label: "op" },
         { keys: ["C"], label: "reate" },
         { keys: ["Q"], label: "uit" }
     ];
@@ -2353,7 +2505,7 @@ namespace FLPlayer {
             var slice = f.read(want);
             if (!slice || !slice.length)
                 return;
-            featForChunk[idx] = chunkFeatures(slice, info.channels);
+            featForChunk[idx] = chunkFeatures(slice, info.channels, info.rate);
             var name = "flr" + (idx % SLOTS) + ".wav";
             var slot = idx % SLOTS;
             console.write(
@@ -2427,6 +2579,9 @@ namespace FLPlayer {
                     quitReq = true;
                 } else if (k === "C") {
                     result = "create";       // jump to the compose-a-song flow
+                    quitReq = true;
+                } else if (k === "T") {
+                    result = "top";          // most-played chart
                     quitReq = true;
                 } else if (k === "A") {
                     result = "addplaylist";  // add the current track to a playlist
@@ -2908,7 +3063,11 @@ namespace FLPlayer {
         // drains the FIFO and stops the head immediately.
         apc("A;Flush;C=" + CHANNEL);
         console.write("\x1b[?25h");   // cursor back for the menus
-        dbg("playLoop exit: result=" + result);
+        // Position reached == time heard: this player never seeks and the
+        // clock freezes while paused, so the caller can apply the play rule.
+        lastPlayMs = Math.max(0, Math.min(playMs || 0, totalSec * 1000));
+        lastTotalSec = totalSec;
+        dbg("playLoop exit: result=" + result + " played=" + Math.round(lastPlayMs / 1000) + "s");
         return result;
     }
 
@@ -2945,6 +3104,27 @@ namespace FLPlayer {
             throw new Error("fat data offset wrong: " + fatInfo.dataOffset);
         if (fatInfo.dataBytes !== pcm.length)
             throw new Error("fat data bytes wrong");
+
+        // Rate invariance: the SAME tone (~438 Hz) sampled at 11025 Hz mono —
+        // the 3dBBS profile — must read the same brightness and land in the
+        // same band as the 22050 Hz stereo desktop stream. Uncorrected, half
+        // the rate doubles crossings-per-frame (everything reads "bright" and
+        // the dZcr section detector trips) and drags the one-pole crossovers
+        // down an octave (bass energy leaks into the mid meter).
+        var pcmHalf = "";
+        for (var hi2 = 0; hi2 < 1000; hi2++) {
+            var hv = Math.round(Math.sin(hi2 / 4) * 12000);   // same Hz, half rate
+            if (hv < 0) hv += 0x10000;
+            pcmHalf += String.fromCharCode(hv & 0xff, (hv >> 8) & 0xff);
+        }
+        var fFull = chunkFeatures(pcm, 2, 22050);
+        var fHalf = chunkFeatures(pcmHalf, 1, 11025);
+        if (Math.abs(fFull.zcr - fHalf.zcr) > 0.05)
+            throw new Error("zcr not rate-invariant: " + fFull.zcr.toFixed(3) +
+                " vs " + fHalf.zcr.toFixed(3));
+        if (Math.abs(fFull.lo - fHalf.lo) > 0.15 || Math.abs(fFull.mid - fHalf.mid) > 0.15)
+            throw new Error("bands not rate-invariant: lo " + fFull.lo.toFixed(2) + "/" +
+                fHalf.lo.toFixed(2) + " mid " + fFull.mid.toFixed(2) + "/" + fHalf.mid.toFixed(2));
 
         // Feature extraction: a loud sine has high RMS and some crossings;
         // silence has neither.
@@ -3052,7 +3232,7 @@ namespace FLPlayer {
 
         // Reply parser: feature reply, drain notify, arrows, keys, lone ESC.
         var p = new InputPump();
-        var res: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var res: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         (p as any).buf = "\x1b[=7;100;1nq\x1b[C\x1b[=7;2;0n\x1b";
         (p as any).drain(res, true);
         if (res.audio.length !== 2) throw new Error("audio events: " + res.audio.length);
@@ -3066,18 +3246,43 @@ namespace FLPlayer {
         (p as any).drain(res, true);
         if (!res.esc) throw new Error("aged lone ESC did not resolve");
 
+        // APC strings (ESC _ ... ST): the 3dBBS capability reply must come out
+        // as an apc body, NOT as a quit plus the payload typed as keystrokes.
+        // Before the APC branch existed this exact input yielded esc=true and
+        // keys "3DS:VER;0;3" — S (shuffle), V (volume) and R (restart) all
+        // firing on the way out of the player.
+        var pApc = new InputPump();
+        var rApc: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
+        (pApc as any).buf = "\x1b_3DS:Ver;0;3\x1b\\q";
+        (pApc as any).drain(rApc, true);
+        if (rApc.apc.length !== 1 || rApc.apc[0] !== "3DS:Ver;0;3")
+            throw new Error("APC body parse: " + rApc.apc.join("|"));
+        if (rApc.esc) throw new Error("APC string leaked a quit");
+        if (rApc.keys.join("") !== "Q") throw new Error("APC swallowed the trailing key");
+        // A split APC must wait for its ST rather than mis-firing as Esc.
+        var pApcS = new InputPump();
+        var rApcS: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
+        (pApcS as any).buf = "\x1b_3DS:Ver;0";
+        (pApcS as any).drain(rApcS, true);
+        if (rApcS.esc || rApcS.apc.length || rApcS.keys.length)
+            throw new Error("partial APC resolved too eagerly");
+        (pApcS as any).buf += ";3\x1b\\";
+        (pApcS as any).drain(rApcS, true);
+        if (rApcS.apc.length !== 1 || rApcS.apc[0] !== "3DS:Ver;0;3")
+            throw new Error("split APC did not resolve");
+
         // SS3 / application-cursor arrows (ESC O A..D): decode as arrows, never
         // as a bare Esc plus a stray letter. Also: a split SS3 must wait, not
         // mis-fire.
         var pSS3 = new InputPump();
-        var rSS3: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var rSS3: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         (pSS3 as any).buf = "\x1bOA\x1bOB\x1bOC\x1bOD";
         (pSS3 as any).drain(rSS3, true);
         if (rSS3.arrows.join(",") !== "up,down,right,left")
             throw new Error("SS3 arrow parse: " + rSS3.arrows.join(","));
         if (rSS3.esc || rSS3.keys.length) throw new Error("SS3 arrows leaked esc/keys");
         var pSS3s = new InputPump();
-        var rSS3s: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var rSS3s: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         (pSS3s as any).buf = "\x1bO";
         (pSS3s as any).drain(rSS3s, true);
         if (rSS3s.esc || rSS3s.arrows.length) throw new Error("partial SS3 resolved too eagerly");
@@ -3090,7 +3295,7 @@ namespace FLPlayer {
         // the pump must surface those as arrows. KEY_DOWN (\x0a) must NOT read as
         // Enter -- that made the song list's Down arrow play the track.
         var pNav = new InputPump();
-        var rNav: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var rNav: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         (pNav as any).buf = "\x1e\x0a\x1d\x06\x10\x0e\x02\x05";
         (pNav as any).drain(rNav, true);
         if (rNav.arrows.join(",") !== "up,down,left,right,pgup,pgdn,home,end")
@@ -3100,7 +3305,7 @@ namespace FLPlayer {
         // The killer case: an audio notify split right after its ESC byte
         // must NOT become Esc + plain chars (the phantom 'N' bug).
         var pSplit = new InputPump();
-        var rSplit: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var rSplit: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         (pSplit as any).buf = "\x1b";
         (pSplit as any).drain(rSplit, true);    // pump boundary hits mid-sequence
         (pSplit as any).buf += "[=7;2;0n";      // the rest arrives next pump
@@ -3110,7 +3315,7 @@ namespace FLPlayer {
         if (rSplit.audio.length !== 1 || rSplit.audio[0][0] !== 2 || rSplit.audio[0][1] !== 0)
             throw new Error("split notify not reassembled");
         var p3 = new InputPump();
-        var r3: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var r3: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         (p3 as any).buf = "\x1b[74;162R";
         (p3 as any).drain(r3, true);
         if (r3.cpr.length !== 1 || r3.cpr[0][0] !== 74 || r3.cpr[0][1] !== 162)
@@ -3129,20 +3334,20 @@ namespace FLPlayer {
         // the ESC; the bare tail must become an audio event, NOT keys ending
         // in a phantom 'N'.
         var pOrf = new InputPump();
-        var rOrf: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var rOrf: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         (pOrf as any).buf = "[=7;2;0n";
         (pOrf as any).drain(rOrf, true);
         if (rOrf.keys.length) throw new Error("orphan tail leaked keys: " + rOrf.keys.join(""));
         if (rOrf.audio.length !== 1 || rOrf.audio[0][0] !== 2 || rOrf.audio[0][1] !== 0)
             throw new Error("orphan tail not recovered as audio");
         // Orphaned CPR tail likewise.
-        var rOrf2: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var rOrf2: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         (pOrf as any).buf = "[74;162R";
         (pOrf as any).drain(rOrf2, true);
         if (rOrf2.keys.length || rOrf2.cpr.length !== 1 || rOrf2.cpr[0][0] !== 74)
             throw new Error("orphan CPR not recovered");
         // A real '[' keystroke still gets through once aged.
-        var rOrf3: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var rOrf3: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         (pOrf as any).buf = "[";
         (pOrf as any).bracketAt = nowMs() - 300;
         (pOrf as any).drain(rOrf3, true);
@@ -3151,7 +3356,7 @@ namespace FLPlayer {
 
         // Split CSI across feeds must not produce phantom keys.
         var p2 = new InputPump();
-        var r2: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var r2: PumpResult = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         (p2 as any).buf = "\x1b[=7;2";
         (p2 as any).drain(r2, false);
         if (r2.keys.length || r2.audio.length || r2.esc) throw new Error("partial CSI leaked");
@@ -3209,10 +3414,15 @@ namespace FLPlayer {
 
         // Optional end-to-end leg: --selftest <mp3path> exercises the real
         // ffmpeg transcode + header parse + slicing on an actual track.
+        // Adding --3ds applies the 3dBBS handheld profile first, so the
+        // reported chunkB64 is the size that terminal will actually receive
+        // (a sysop can compare the two runs without a 3DS in hand).
         var mp3 = "";
         if (typeof argv !== "undefined" && argv) {
             for (var ai = 0; ai < argv.length; ai++) {
-                if (argv[ai] !== "--selftest" && file_exists(argv[ai]))
+                if (argv[ai] === "--3ds")
+                    apply3dbbsProfile();
+                else if (argv[ai] !== "--selftest" && file_exists(argv[ai]))
                     mp3 = argv[ai];
             }
         }
@@ -3242,7 +3452,7 @@ namespace FLPlayer {
             var slice = tf.read(chunkB);
             tf.close();
             if (!slice || slice.length !== chunkB) throw new Error("slice read failed");
-            var feats = chunkFeatures(slice, inf.channels);
+            var feats = chunkFeatures(slice, inf.channels, inf.rate);
             var b64len = base64_encode(wavHeader(slice.length, inf.rate, inf.channels) + slice).length;
             writeln(format("FLPlayer transcode test: OK  rate=%d ch=%d duration=%ds chunks=%d chunkB64=%d rms=%s zcr=%s",
                 inf.rate, inf.channels, Math.round(inf.dataBytes / bps),

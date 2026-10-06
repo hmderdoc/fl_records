@@ -39,6 +39,8 @@ interface TrackSummary {
     trackNumber: string;
     lyricsText?: string;
     ansiArtBase64?: string;
+    plays?: number;        // from the shared play-count store (0 when absent)
+    lastPlayed?: number;   // unix time of the latest counted play
 }
 
 interface TrackFilters {
@@ -141,6 +143,8 @@ interface AppState {
     try { load("utf8_cp437.js"); } catch (_) { }
     try { load("utf8_utf16.js"); } catch (_) { }
     try { load("json-db.js"); } catch (_) { }   // per-user playlist storage
+    // Shared play-count store (same file the web radio counts into).
+    try { load(system.mods_dir + "load/fl_playcounts.js"); } catch (_) { }
 
     function createDefaultFilters(): TrackFilters {
         return {
@@ -799,7 +803,164 @@ interface AppState {
     function loadCatalog(forceRefresh: boolean): TrackSummary[] {
         var tracks = loadCatalogInner(forceRefresh);
         applyTrackOverrides(tracks);
+        applyPlayCounts(tracks);
         return tracks;
+    }
+
+    // ---- play counts (shared with the web radio) -------------------------
+    function playCountsAvailable(): boolean {
+        return typeof FLPlayCounts !== "undefined" && !!FLPlayCounts;
+    }
+
+    // Stamp every catalog entry with its current play count.
+    function applyPlayCounts(tracks: TrackSummary[]): void {
+        var counts: any = {};
+        if (!playCountsAvailable()) return;
+        try { counts = FLPlayCounts.counts() || {}; } catch (_) { return; }
+        for (var i = 0; i < tracks.length; i += 1) {
+            var entry = counts[lower(tracks[i].name)];
+            tracks[i].plays = entry ? (entry.plays || 0) : 0;
+            tracks[i].lastPlayed = entry ? (entry.last_played || 0) : 0;
+        }
+    }
+
+    // After the player returns: count the play if the listener heard enough
+    // of it (the store applies the 30-second rule and per-user throttle).
+    function recordTerminalPlay(track: TrackSummary): void {
+        if (!playCountsAvailable() || !track) return;
+        try {
+            var result = FLPlayCounts.record(track.name, {
+                source: "door",
+                user: user && user.number ? user.number : 0,
+                listened: FLPlayer.lastPlayMs / 1000,
+                duration: FLPlayer.lastTotalSec
+            });
+            if (result && result.counted) {
+                track.plays = result.plays;
+                track.lastPlayed = result.last_played;
+            }
+        } catch (err) {
+            log(LOG_WARNING, "fl_records: play count failed: " + err);
+        }
+    }
+
+    // Catalog entries ranked by play count (most played first).
+    function topPlayedTracks(app: AppState, limit: number): TrackSummary[] {
+        var byName: { [key: string]: TrackSummary } = {};
+        var out: TrackSummary[] = [];
+        if (!playCountsAvailable()) return out;
+        applyPlayCounts(app.catalog);   // fresh numbers (the web may have counted since launch)
+        for (var i = 0; i < app.catalog.length; i += 1) byName[lower(app.catalog[i].name)] = app.catalog[i];
+        var ranked: any[] = [];
+        try { ranked = FLPlayCounts.top(0) || []; } catch (_) { ranked = []; }
+        for (var r = 0; r < ranked.length && out.length < limit; r += 1) {
+            var hit = byName[lower(ranked[r].name)];
+            if (hit) out.push(hit);
+        }
+        return out;
+    }
+
+    // "Top Played" chart: lightbar list, ENTER/SPACE plays the highlighted
+    // song with the chart (in rank order) as the queue, ESC backs out.
+    function topPlayedScreen(app: AppState): { list: TrackSummary[]; index: number } | null {
+        var result: { list: TrackSummary[]; index: number } | null = null;
+        var ranked = topPlayedTracks(app, 100);
+        withConsoleScreen(function (): void {
+            var sel = 0;
+            var top = 0;
+            var lastCols = 0;
+            var lastRows = 0;
+            var full = true;
+            var dirty = true;
+            var done = false;
+
+            if (!ranked.length) {
+                console.clear();
+                printConsoleHeader("Top Played");
+                console.writeln("");
+                console.writeln("  No plays counted yet. A play counts after 30 seconds of");
+                console.writeln("  listening, here in the terminal or on the web radio.");
+                console.writeln("");
+                waitForAnyKey();
+                return;
+            }
+
+            while (!done && bbs.online && !js.terminated) {
+                var cols = Math.max(40, console.screen_columns || 80);
+                var rows = Math.max(10, console.screen_rows || 24);
+                if (cols !== lastCols || rows !== lastRows) { full = true; lastCols = cols; lastRows = rows; }
+                var listTop = 4;
+                var listH = Math.max(1, rows - listTop);
+                if (sel < top) top = sel;
+                if (sel >= top + listH) top = sel - listH + 1;
+                if (top < 0) top = 0;
+
+                if (full) { console.write("\x1b[?25l\x1b[2J"); full = false; dirty = true; }
+                if (dirty) {
+                    console.write(csiAt(1, 1) + csiSgr("0;1;33") +
+                        padClip(" FUTURELAND RECORDS  --  Top Played", cols) + CSI_RESET);
+                    var count = " " + ranked.length + " charted ";
+                    var widths = topPlayedWidths(cols);
+                    console.write(csiAt(2, 1) + csiSgr("0;1;37") +
+                        padClip("   #  PLAYS  " + padRight("TITLE", widths.titleW) + "  ARTIST", Math.max(0, cols - count.length)) +
+                        csiSgr("0;1;33") + count + CSI_RESET);
+                    console.write(csiAt(3, 1) + csiSgr("0;30;43") +
+                        padClip("  ENTER/SPACE play from here   ESC back  ", cols) + CSI_RESET);
+                    for (var r = 0; r < listH; r += 1) {
+                        var idx = top + r;
+                        var y = listTop + r;
+                        var w = (y >= rows) ? cols - 1 : cols;   // never write the bottom-right cell
+                        var txt = idx < ranked.length ? topPlayedRow(ranked[idx], idx + 1, cols) : "";
+                        var on = idx === sel;
+                        console.write(csiAt(y, 1) + csiSgr(on ? "0;30;43" : "0;37") + padClip(txt, w) + CSI_RESET);
+                    }
+                    dirty = false;
+                }
+
+                var k = FLPlayer.readKey(120);
+                if (k.length) {
+                    dirty = true;
+                    if (k === "\x1b") {
+                        done = true;
+                    } else if (k === "\r" || k === " ") {
+                        result = { list: ranked.slice(), index: sel };
+                        done = true;
+                    } else if (k === "\x1e") {                   // up
+                        sel = sel > 0 ? sel - 1 : ranked.length - 1;
+                    } else if (k === "\x0a") {                   // down
+                        sel = (sel + 1) % ranked.length;
+                    } else if (k === "\x10" || k === "\x1d") {   // page up / left
+                        sel = Math.max(0, sel - listH);
+                    } else if (k === "\x0e" || k === "\x06") {   // page down / right
+                        sel = Math.min(ranked.length - 1, sel + listH);
+                    } else if (k === "\x02") {                   // home
+                        sel = 0;
+                    } else if (k === "\x05") {                   // end
+                        sel = ranked.length - 1;
+                    }
+                }
+            }
+            console.write("\x1b[?25h" + CSI_RESET);
+        });
+        return result;
+    }
+
+    // Column widths for the chart: " ### PPPPP  TITLE...  ARTIST" (13 fixed cols).
+    function topPlayedWidths(cols: number): { titleW: number; artistW: number } {
+        var artistW = Math.max(12, Math.min(30, cols - 52));
+        var titleW = Math.max(20, cols - 13 - artistW - 2);
+        return { titleW: titleW, artistW: artistW };
+    }
+
+    function topPlayedRow(track: TrackSummary, rank: number, cols: number): string {
+        var rankTxt = String(rank);
+        while (rankTxt.length < 3) rankTxt = " " + rankTxt;
+        var playsTxt = String(track.plays || 0);
+        while (playsTxt.length < 5) playsTxt = " " + playsTxt;
+        var widths = topPlayedWidths(cols);
+        var title = truncateText(toScreenText(displayTrackTitle(track)), widths.titleW);
+        var artist = truncateText(toScreenText(displayTrackArtist(track)), widths.artistW);
+        return " " + rankTxt + "  " + playsTxt + "  " + padRight(title, widths.titleW) + "  " + artist;
     }
 
     function loadCatalogInner(forceRefresh: boolean): TrackSummary[] {
@@ -1147,6 +1308,7 @@ interface AppState {
         lines.push("Size: " + track.size + " bytes");
         lines.push("Modified: " + (track.mtime ? system.datestr(track.mtime) : "-"));
         lines.push("Added: " + (track.added ? system.datestr(track.added) : "-"));
+        lines.push("Plays: " + (track.plays || 0) + (track.lastPlayed ? " (last " + system.datestr(track.lastPlayed) + ")" : ""));
         lines.push("Description: " + toScreenText(track.description || "-"));
         lines.push("Embedded ANSI art: " + (parsed.ansiArtBase64.length ? "Yes" : "No"));
         lines.push("Embedded lyrics: " + ((parsed.lyricsText.length || parsed.syncedLyrics.length) ? "Yes" : "No"));
@@ -1205,7 +1367,7 @@ interface AppState {
             includeLyrics: true,
             includeAnsiArt: false
         });
-        var lyrics = trimValue(parsed.lyricsText || loadSidecarLyrics(track));
+        var lyrics = trimValue(loadSidecarLyrics(track) || parsed.lyricsText);
 
         if (!lyrics.length) {
             console.clear();
@@ -1408,7 +1570,11 @@ interface AppState {
                 waitForAnyKey();
                 return;
             }
-            console.writeln("Audio sink: " + (sink === "syncterm" ? "SyncTERM (libsndfile)" : "APC bridge"));
+            // Naming the handheld here is the only visible confirmation that
+            // the low-bandwidth profile engaged — the symptom it fixes (audio
+            // chop) is otherwise indistinguishable from a slow link.
+            console.writeln("Audio sink: " + (FLPlayer.is3dbbs() ? "3dBBS (low-bandwidth)"
+                : sink === "syncterm" ? "SyncTERM (libsndfile)" : "APC bridge"));
 
             var curList = (list && list.length) ? list : [track];
             var idx = typeof index === "number" ? Math.max(0, Math.min(index, curList.length - 1)) : 0;
@@ -1434,21 +1600,21 @@ interface AppState {
                     includeLyrics: true,
                     includeAnsiArt: true
                 });
-                // Timed lyrics: embedded SYLT first, then a timestamped .lrc
-                // sidecar; untimed text distributes evenly over the duration.
-                var timed: FLPlayer.LyricLine[] = [];
-                if (parsed.syncedLyrics && parsed.syncedLyrics.length) {
+                // Timed lyrics: a timestamped .lrc sidecar first (the web
+                // editor saves corrections there, and the web prefers it too),
+                // then embedded SYLT; untimed text distributes evenly over
+                // the duration.
+                var timed: FLPlayer.LyricLine[] = loadSidecarSyncedLyrics(cur);
+                if (!timed.length && parsed.syncedLyrics && parsed.syncedLyrics.length) {
                     for (var si = 0; si < parsed.syncedLyrics.length; si++) {
                         timed.push({
                             time: parsed.syncedLyrics[si].time,
                             text: toScreenText(parsed.syncedLyrics[si].text)
                         });
                     }
-                } else {
-                    timed = loadSidecarSyncedLyrics(cur);
                 }
                 var flat = timed.length ? "" :
-                    toScreenText(trimValue(parsed.lyricsText || loadSidecarLyrics(cur)));
+                    toScreenText(trimValue(loadSidecarLyrics(cur) || parsed.lyricsText));
                 var residentAvatars = trackAvatars(cur);
                 var playable: FLPlayer.PlayableTrack = {
                     path: cur.path,
@@ -1469,6 +1635,7 @@ interface AppState {
                     queueLen: curList.length
                 };
                 var outcome = FLPlayer.playTrack(playable);
+                if (outcome !== "error") recordTerminalPlay(cur);
                 // Honor whatever was pressed while the player was tearing
                 // down / the next track was loading: Q still quits, and
                 // buffered N/P adjust how far we move — no more sailing past
@@ -1506,6 +1673,20 @@ interface AppState {
                 }
                 if (outcome === "addplaylist") {
                     addToPlaylistFlow(curList[idx].name, displayTrackTitle(curList[idx]));
+                    console.clear();
+                    continue;
+                }
+                if (outcome === "top") {
+                    // Most-played chart: picking plays the chart in rank order
+                    // (no shuffle); backing out resumes the current queue.
+                    var chart = topPlayedScreen(activeApp);
+                    if (chart && chart.list.length) {
+                        curList = chart.list;
+                        idx = Math.max(0, Math.min(chart.index, curList.length - 1));
+                        currentPlaylist = "";
+                        FLPlayer.shuffle = false;
+                        history = []; seedBag(bag, curList.length, idx); passPos = 1; FLPlayer.shuffleReset = false;   // fresh queue
+                    }
                     console.clear();
                     continue;
                 }
@@ -2843,6 +3024,44 @@ interface AppState {
         writeln("playlist self-test: OK");
     }
 
+    // Play counting through the shared store, against a scratch file so the
+    // live chart is untouched: the 30s rule, the per-user throttle, and the
+    // catalog stamping that feeds the Top Played chart.
+    function playCountSelfTest(): void {
+        if (!playCountsAvailable()) { writeln("play-count self-test: SKIP (fl_playcounts.js not loaded)"); return; }
+        var livePath = FLPlayCounts.path;
+        var testPath = pathJoin(dataDirPath(), "__fltest-playcounts__.json");
+        FLPlayCounts.configure({ path: testPath });
+        try {
+            if (file_exists(testPath)) file_remove(testPath);
+            var r = FLPlayCounts.record("Test_Song.mp3", { source: "door", user: 1, listened: 12, duration: 180 });
+            if (r.counted) throw new Error("12s of 180s counted as a play");
+            r = FLPlayCounts.record("Test_Song.mp3", { source: "door", user: 1, listened: 31, duration: 180 });
+            if (!r.counted || r.plays !== 1) throw new Error("31s not counted: " + JSON.stringify(r));
+            r = FLPlayCounts.record("test_song.mp3", { source: "door", user: 1, listened: 31, duration: 180 });
+            if (r.counted || r.reason !== "throttled") throw new Error("repeat within 30s not throttled: " + JSON.stringify(r));
+            r = FLPlayCounts.record("test_song.mp3", { source: "web", user: 2, listened: 31, duration: 180 });
+            if (!r.counted || r.plays !== 2) throw new Error("second user not counted: " + JSON.stringify(r));
+            r = FLPlayCounts.record("Short.mp3", { source: "door", user: 1, listened: 9, duration: 10 });
+            if (!r.counted) throw new Error("90% of a 10s track should count");
+            var fake: AppState = createAppState();
+            fake.catalog = [
+                buildSummary({ name: "Short.mp3" }, "/x/Short.mp3", 1, 0, emptyParsedTags()),
+                buildSummary({ name: "Test_Song.mp3" }, "/x/Test_Song.mp3", 1, 0, emptyParsedTags()),
+                buildSummary({ name: "Never.mp3" }, "/x/Never.mp3", 1, 0, emptyParsedTags())
+            ];
+            var ranked = topPlayedTracks(fake, 10);
+            if (ranked.length !== 2) throw new Error("chart length " + ranked.length);
+            if (ranked[0].name !== "Test_Song.mp3" || ranked[0].plays !== 2) throw new Error("chart order: " + ranked[0].name);
+            if (fake.catalog[2].plays !== 0) throw new Error("unplayed track should stamp 0");
+            if (topPlayedRow(ranked[0], 1, 80).indexOf("   1      2  Test_Song") !== 0) throw new Error("row format: " + topPlayedRow(ranked[0], 1, 80));
+            writeln("play-count self-test: OK");
+        } finally {
+            if (file_exists(testPath)) file_remove(testPath);
+            FLPlayCounts.configure({ path: livePath });
+        }
+    }
+
     // No-repeat shuffle: every queue track must play before any repeats, and a
     // track never lands twice in a row.
     function shuffleSelfTest(): void {
@@ -2922,6 +3141,7 @@ interface AppState {
         if (typeof argv !== "undefined" && argv && argv.indexOf("--selftest") >= 0) {
             sanitizerSelfTest();
             playlistSelfTest();
+            playCountSelfTest();
             shuffleSelfTest();
             FLPlayer.selfTest();
             return;

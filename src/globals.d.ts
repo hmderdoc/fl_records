@@ -171,6 +171,7 @@ declare function load(...args: any[]): any;
 declare function require(...args: any[]): any;
 declare function log(level: number, message: string): void;
 declare function file_exists(path: string): boolean;
+declare function file_remove(path: string): boolean;
 declare function file_size(path: string): number;
 declare function file_date(path: string): number;
 declare function file_getname(path: string): string;
@@ -190,6 +191,8 @@ declare function format(fmt: string, ...args: any[]): string;
 declare function time(): number;
 declare function ctrl(value: string): string;
 declare function exit(code?: number): never;
+// Shared play-count store, /sbbs/mods/load/fl_playcounts.js (absent = counting off).
+declare var FLPlayCounts: any;
 
 declare var WIN_SAV: number;
 declare var WIN_ACT: number;

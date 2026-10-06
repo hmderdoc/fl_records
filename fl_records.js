@@ -1300,6 +1300,10 @@ var FLPlayer;
     // "K_NONE is not defined".
     load("sbbsdefs.js");
     // ---- tuning -------------------------------------------------------
+    // These are the DESKTOP profile (SyncTERM/BBSproxy on a real computer).
+    // They are `var`, not const, because detectSink() re-points them at the
+    // low-bandwidth profile when the caller turns out to be a 3dBBS handheld
+    // — see apply3dbbsProfile() for why that terminal needs its own set.
     var CHUNK_MS = 300; // clip length; also the pacing quantum
     var PREBUFFER = 3; // chunks queued ahead of realtime
     var CHANNEL = 2; // first APC-dedicated channel (0/1 are cterm's)
@@ -1330,6 +1334,11 @@ var FLPlayer;
     // it on the next advance to start a BRAND-NEW shuffle from position 1, rather
     // than resuming the old deck -- so shuffle->off->on gives a fresh shuffle.
     FLPlayer.shuffleReset = false;
+    // Set by playLoop on exit: how far into the track the listener got (ms)
+    // and the track's length (s). playInTerminal turns these into a play
+    // count via the shared store's 30-second rule.
+    FLPlayer.lastPlayMs = 0;
+    FLPlayer.lastTotalSec = 0;
     // ---- small helpers --------------------------------------------------
     function shellQuote(s) {
         return "'" + s.replace(/'/g, "'\\''") + "'";
@@ -1472,7 +1481,7 @@ var FLPlayer;
         }
         /** Poll for up to maxMs, decoding everything that arrives. */
         InputPump.prototype.pump = function (maxMs) {
-            var res = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+            var res = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
             var deadline = nowMs() + maxMs;
             do {
                 var k = console.inkey(K_NONE, 10);
@@ -1572,6 +1581,24 @@ var FLPlayer;
                     }
                     // ESC O <other>: not an arrow, fall through to Esc handling.
                 }
+                // APC string (ESC _ ... ST) — where the 3dBBS capability reply
+                // lands. Without this branch the ESC fell through below as the
+                // quit key and the body arrived as plain keystrokes: probing a
+                // 3DS would have answered "3DS:Ver;0;3" and handed the player a
+                // phantom S (shuffle), V (volume) and R (restart) on the way
+                // out. Wait for the ST terminator; an unterminated body ages
+                // out rather than wedging the buffer.
+                if (this.buf.charAt(1) === "_") {
+                    var stAt = this.buf.indexOf("\x1b\\", 2);
+                    if (stAt < 0) {
+                        if (idle && this.buf.length > 512)
+                            this.buf = ""; // malformed: don't wedge
+                        return; // incomplete APC: wait for ST
+                    }
+                    res.apc.push(this.buf.substring(2, stAt));
+                    this.buf = this.buf.substr(stAt + 2);
+                    continue;
+                }
                 if (this.buf.charAt(1) !== "[") {
                     res.esc = true; // ESC + non-CSI: treat as Esc, re-scan rest
                     this.buf = this.buf.substr(1);
@@ -1651,6 +1678,8 @@ var FLPlayer;
             bits.push("audio=" + ev.audio[i][0] + ":" + ev.audio[i][1]);
         for (var c = 0; c < ev.cpr.length; c++)
             bits.push("cpr=" + ev.cpr[c][0] + "x" + ev.cpr[c][1]);
+        for (var p = 0; p < ev.apc.length; p++)
+            bits.push("apc=" + ev.apc[p]);
         for (var o = 0; o < ev.other.length; o++)
             bits.push("other=^" + ev.other[o]);
         return bits.join(" ");
@@ -1743,10 +1772,77 @@ var FLPlayer;
         return normalizeKey("\x1b" + seq);
     }
     FLPlayer.readKey = readKey;
+    // ---- 3dBBS (Nintendo 3DS) profile -------------------------------------
+    /**
+     * 3dBBS is a Nintendo 3DS homebrew terminal. It answers Q;libsndfile
+     * truthfully, so the sink probe below classifies it as "syncterm" and —
+     * before this — it was handed the full desktop stream: 22050 Hz stereo
+     * s16 is 88 KB/s of PCM, ~118 KB/s once base64'd into APC frames.
+     *
+     * That is more than the handheld can physically consume. 3dBBS drains its
+     * 256 KB socket ring through exactly ONE 8192-byte parse per rendered
+     * frame (3dBBS source/main.c: `telnetRead(rxbuf, sizeof rxbuf)`), so its
+     * intake ceiling is 8 KB x fps — and the art wipes spend part of that same
+     * budget, ~13 KB for a full-art frame since every cell changes palette. A
+     * 300 ms desktop chunk is ~35 KB of base64: five frames of parse for one
+     * clip, with the next due every 300 ms, and the track-start burst
+     * (PREBUFFER + 2 chunks) drops ~177 KB into that 256 KB ring at once. The
+     * ring backs up, recv() stops draining, and playback chops — the reported
+     * "glitches out at latency" symptom.
+     *
+     * Two of the three levers are free, because the client discards that data
+     * on arrival anyway:
+     *   - Stereo: 3dBBS decodes "PCM16/U8, mono or stereo -> mono s16"
+     *     (source/audio/apcaudio.c wavDecode) — the second channel is
+     *     downmixed away. Sending it was pure waste.
+     *   - 22050 Hz: resampled again for a handheld speaker.
+     * Mono at 11025 Hz is 22 KB/s of PCM, ~29 KB/s on the wire: a 4x cut that
+     * puts one chunk at ~9 KB (about a single frame's parse) and the start
+     * burst at ~44 KB. The UI cadence eases off as well so beat-driven wipes
+     * stop racing the audio for the same 8 KB.
+     *
+     * The transcode cache key already includes rate x channels, so the two
+     * profiles coexist on disk rather than invalidating each other.
+     */
+    var CTERM_3DBBS = 1332; // CTerm version 3dBBS reports (matches scene3d.js)
+    var QUERY_3DS = "\x1b_3DS:Query\x1b\\";
+    // Grace after the libsndfile reply to let a 3DS:Ver answer land behind it.
+    // Real SyncTERM reports CTerm 1.332 too (src/conio/cterm.c revision
+    // string), so the version pre-filter cannot tell the two apart and there
+    // is no negative reply to wait on — the probes go out together and this is
+    // the only added cost on a desktop terminal, once per session.
+    var QUERY_3DS_GRACE_MS = 250;
+    var is3dbbsCache = false;
+    /** True when the caller is a 3dBBS handheld (valid after detectSink). */
+    function is3dbbs() {
+        return is3dbbsCache;
+    }
+    FLPlayer.is3dbbs = is3dbbs;
+    /** Worth sending the 3DS probe at all? (see PROTOCOL.md detection ladder) */
+    function may3dbbs() {
+        try {
+            return typeof console.cterm_version === "number" &&
+                console.cterm_version >= CTERM_3DBBS;
+        }
+        catch (e) {
+            return false;
+        }
+    }
+    /** Re-point the streaming/UI tuning at the handheld's intake budget. */
+    function apply3dbbsProfile() {
+        PCM_CHANNELS = 1; // client downmixes to mono regardless
+        PCM_RATE = 11025; // 4x less wire traffic together with mono
+        UI_TICK_MS = 220; // leave parse budget for the audio stream
+        dbg("3dBBS profile: " + PCM_RATE + "Hz x" + PCM_CHANNELS +
+            " ui=" + UI_TICK_MS + "ms");
+    }
     // ---- sink detection ---------------------------------------------------
     /**
      * Two-stage probe:
      *  1. APC SyncTERM:Q;libsndfile -> CSI =7;100;1 n  => real SyncTERM.
+     *     Sent alongside APC 3DS:Query -> APC 3DS:Ver;maj;min, which only a
+     *     3dBBS handheld answers; both are APC jobs on its FIFO worker, so
+     *     the version reply follows the feature reply closely.
      *  2. Store+Load+Queue a ~60ms silent clip with Update armed; a
      *     CSI =7;<ch>;0 n drain notify => any APC sink (BBSproxy).
      * Cached for the session; pass force=true to redetect.
@@ -1756,19 +1852,45 @@ var FLPlayer;
             return detectedSink;
         var pumpr = sharedPump;
         var found = "none";
+        var probing3ds = may3dbbs();
+        is3dbbsCache = false;
         apc("Q;libsndfile");
+        if (probing3ds)
+            console.write(QUERY_3DS);
         var deadline = nowMs() + 700;
+        var graceUntil = 0; // set once the feature reply lands
         while (nowMs() < deadline) {
             var r = pumpr.pump(50);
             for (var i = 0; i < r.audio.length; i++) {
-                if (r.audio[i][0] === 100 && r.audio[i][1] === 1) {
+                if (r.audio[i][0] === 100 && r.audio[i][1] === 1)
                     found = "syncterm";
-                    break;
+            }
+            for (var a = 0; a < r.apc.length; a++) {
+                if (r.apc[a].substr(0, 8) === "3DS:Ver;") {
+                    is3dbbsCache = true;
+                    dbg("3dBBS detected: " + r.apc[a]);
                 }
             }
-            if (found !== "none")
-                break;
+            if (is3dbbsCache) {
+                // 3dBBS answers Q;libsndfile with 1 by contract (PROTOCOL.md
+                // s4), so a version reply that beat the feature reply into a
+                // separate batch still settles the sink — without this the
+                // probe would fall through to the 1.2s silent-clip fallback.
+                found = "syncterm";
+                break; // both answers in; nothing left to wait for
+            }
+            if (found !== "none") {
+                if (!probing3ds)
+                    break;
+                if (!graceUntil)
+                    graceUntil = nowMs() + QUERY_3DS_GRACE_MS;
+                else if (nowMs() >= graceUntil)
+                    break; // desktop terminal: no 3DS reply is coming
+            }
         }
+        // Applied before the silence probe below, which streams at this format.
+        if (is3dbbsCache)
+            apply3dbbsProfile();
         if (found === "none") {
             // Silent probe clip: 60ms of zeros at the streaming format.
             var bytes = Math.floor(PCM_RATE * PCM_CHANNELS * 2 * 0.06);
@@ -1802,7 +1924,23 @@ var FLPlayer;
         return out.substr(0, count);
     }
     // ---- per-chunk audio features -----------------------------------------
-    function chunkFeatures(slice, channels) {
+    // The reference rate the brightness/band constants below were tuned at.
+    // Features must describe the AUDIO, not the sample rate it arrived in, so
+    // the 3dBBS profile's 11025 Hz stream drives the visualizer identically to
+    // a desktop 22050 Hz one.
+    var FEATURE_REF_RATE = 22050;
+    function chunkFeatures(slice, channels, rate) {
+        var featRate = rate && rate > 0 ? rate : FEATURE_REF_RATE;
+        // The two rate corrections below pull in OPPOSITE directions, because
+        // the quantities they fix scale oppositely with the sample rate:
+        //   zcrScale  - crossings are counted PER FRAME, and identical audio
+        //               crosses zero twice as often per frame at half the
+        //               rate, so scale down (0.5 at 11025).
+        //   bandScale - a one-pole's corner is a*rate/2pi, so holding a
+        //               crossover at a fixed FREQUENCY needs a bigger
+        //               coefficient at a lower rate (2.0 at 11025).
+        var zcrScale = featRate / FEATURE_REF_RATE;
+        var bandScale = FEATURE_REF_RATE / featRate;
         var frames = Math.floor(slice.length / (channels * 2));
         if (frames < 2)
             return { rms: 0, raw: 0, zcr: 0, lo: 0, mid: 0, hi: 0 };
@@ -1835,6 +1973,11 @@ var FLPlayer;
         // low-passes split the waveform into lows (<~300Hz) / mids / highs
         // (>~1.3kHz), so the equaliser reacts to real frequency content, not a
         // faked per-bar wobble. lp1/lp2 are the running low-passed signals.
+        // Coefficients scale with bandScale to hold those crossovers at the
+        // same FREQUENCIES on a lower-rate stream (clamped below 1: a one-pole
+        // stops smoothing at all once the coefficient reaches 1).
+        var aLo = clamp(0.08 * bandScale, 0, 0.95);
+        var aMid = clamp(0.34 * bandScale, 0, 0.95);
         var lp1 = 0, lp2 = 0, eLo = 0, eMid = 0, eHi = 0;
         for (var w = 0; w < winFrames; w++) {
             var s = rd16(slice, (start + w) * channels * 2);
@@ -1844,15 +1987,19 @@ var FLPlayer;
                 crossings++;
             prev = s;
             var sn = s / 32768;
-            lp1 += (sn - lp1) * 0.08; // heavy low-pass  -> bass
-            lp2 += (sn - lp2) * 0.34; // lighter low-pass -> bass+mid
+            lp1 += (sn - lp1) * aLo; // heavy low-pass  -> bass
+            lp2 += (sn - lp2) * aMid; // lighter low-pass -> bass+mid
             var bLo = lp1, bMid = lp2 - lp1, bHi = sn - lp2;
             eLo += bLo * bLo;
             eMid += bMid * bMid;
             eHi += bHi * bHi;
         }
         // crossings/frame *at the PCM rate*: ~0.02 = bassy, ~0.25+ = bright.
-        var zcr = clamp((crossings / winFrames) * 5, 0, 1);
+        // Halving the rate doubles crossings-per-frame for identical audio, so
+        // zcrScale converts back to the reference rate before the lift —
+        // otherwise every track reads as "bright" on the handheld and the
+        // section-change detector (dZcr) trips on the shift.
+        var zcr = clamp((crossings / winFrames) * 5 * zcrScale, 0, 1);
         // Band RMS with a per-band perceptual lift (upper bands carry less
         // energy, so they get a bigger multiplier to stay visible on the meter).
         var lo = clamp(Math.sqrt(eLo / winFrames) * 3.6, 0, 1);
@@ -2104,6 +2251,7 @@ var FLPlayer;
         { keys: ["S"], label: "huffle" },
         { keys: ["A"], label: "dd" },
         { keys: ["B"], label: "rowse" },
+        { keys: ["T"], label: "op" },
         { keys: ["C"], label: "reate" },
         { keys: ["Q"], label: "uit" }
     ];
@@ -3552,7 +3700,7 @@ var FLPlayer;
             var slice = f.read(want);
             if (!slice || !slice.length)
                 return;
-            featForChunk[idx] = chunkFeatures(slice, info.channels);
+            featForChunk[idx] = chunkFeatures(slice, info.channels, info.rate);
             var name = "flr" + (idx % SLOTS) + ".wav";
             var slot = idx % SLOTS;
             console.write("\x1b_SyncTERM:C;S;" + name + ";" +
@@ -3626,6 +3774,10 @@ var FLPlayer;
                 }
                 else if (k === "C") {
                     result = "create"; // jump to the compose-a-song flow
+                    quitReq = true;
+                }
+                else if (k === "T") {
+                    result = "top"; // most-played chart
                     quitReq = true;
                 }
                 else if (k === "A") {
@@ -4141,7 +4293,11 @@ var FLPlayer;
         // drains the FIFO and stops the head immediately.
         apc("A;Flush;C=" + CHANNEL);
         console.write("\x1b[?25h"); // cursor back for the menus
-        dbg("playLoop exit: result=" + result);
+        // Position reached == time heard: this player never seeks and the
+        // clock freezes while paused, so the caller can apply the play rule.
+        FLPlayer.lastPlayMs = Math.max(0, Math.min(playMs || 0, totalSec * 1000));
+        FLPlayer.lastTotalSec = totalSec;
+        dbg("playLoop exit: result=" + result + " played=" + Math.round(FLPlayer.lastPlayMs / 1000) + "s");
         return result;
     }
     // ---- self test (jsexec, headless) ----------------------------------------
@@ -4180,6 +4336,27 @@ var FLPlayer;
             throw new Error("fat data offset wrong: " + fatInfo.dataOffset);
         if (fatInfo.dataBytes !== pcm.length)
             throw new Error("fat data bytes wrong");
+        // Rate invariance: the SAME tone (~438 Hz) sampled at 11025 Hz mono —
+        // the 3dBBS profile — must read the same brightness and land in the
+        // same band as the 22050 Hz stereo desktop stream. Uncorrected, half
+        // the rate doubles crossings-per-frame (everything reads "bright" and
+        // the dZcr section detector trips) and drags the one-pole crossovers
+        // down an octave (bass energy leaks into the mid meter).
+        var pcmHalf = "";
+        for (var hi2 = 0; hi2 < 1000; hi2++) {
+            var hv = Math.round(Math.sin(hi2 / 4) * 12000); // same Hz, half rate
+            if (hv < 0)
+                hv += 0x10000;
+            pcmHalf += String.fromCharCode(hv & 0xff, (hv >> 8) & 0xff);
+        }
+        var fFull = chunkFeatures(pcm, 2, 22050);
+        var fHalf = chunkFeatures(pcmHalf, 1, 11025);
+        if (Math.abs(fFull.zcr - fHalf.zcr) > 0.05)
+            throw new Error("zcr not rate-invariant: " + fFull.zcr.toFixed(3) +
+                " vs " + fHalf.zcr.toFixed(3));
+        if (Math.abs(fFull.lo - fHalf.lo) > 0.15 || Math.abs(fFull.mid - fHalf.mid) > 0.15)
+            throw new Error("bands not rate-invariant: lo " + fFull.lo.toFixed(2) + "/" +
+                fHalf.lo.toFixed(2) + " mid " + fFull.mid.toFixed(2) + "/" + fHalf.mid.toFixed(2));
         // Feature extraction: a loud sine has high RMS and some crossings;
         // silence has neither.
         var loud = chunkFeatures(pcm, 2);
@@ -4296,7 +4473,7 @@ var FLPlayer;
             throw new Error("base64 round trip failed");
         // Reply parser: feature reply, drain notify, arrows, keys, lone ESC.
         var p = new InputPump();
-        var res = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var res = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         p.buf = "\x1b[=7;100;1nq\x1b[C\x1b[=7;2;0n\x1b";
         p.drain(res, true);
         if (res.audio.length !== 2)
@@ -4316,11 +4493,37 @@ var FLPlayer;
         p.drain(res, true);
         if (!res.esc)
             throw new Error("aged lone ESC did not resolve");
+        // APC strings (ESC _ ... ST): the 3dBBS capability reply must come out
+        // as an apc body, NOT as a quit plus the payload typed as keystrokes.
+        // Before the APC branch existed this exact input yielded esc=true and
+        // keys "3DS:VER;0;3" — S (shuffle), V (volume) and R (restart) all
+        // firing on the way out of the player.
+        var pApc = new InputPump();
+        var rApc = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
+        pApc.buf = "\x1b_3DS:Ver;0;3\x1b\\q";
+        pApc.drain(rApc, true);
+        if (rApc.apc.length !== 1 || rApc.apc[0] !== "3DS:Ver;0;3")
+            throw new Error("APC body parse: " + rApc.apc.join("|"));
+        if (rApc.esc)
+            throw new Error("APC string leaked a quit");
+        if (rApc.keys.join("") !== "Q")
+            throw new Error("APC swallowed the trailing key");
+        // A split APC must wait for its ST rather than mis-firing as Esc.
+        var pApcS = new InputPump();
+        var rApcS = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
+        pApcS.buf = "\x1b_3DS:Ver;0";
+        pApcS.drain(rApcS, true);
+        if (rApcS.esc || rApcS.apc.length || rApcS.keys.length)
+            throw new Error("partial APC resolved too eagerly");
+        pApcS.buf += ";3\x1b\\";
+        pApcS.drain(rApcS, true);
+        if (rApcS.apc.length !== 1 || rApcS.apc[0] !== "3DS:Ver;0;3")
+            throw new Error("split APC did not resolve");
         // SS3 / application-cursor arrows (ESC O A..D): decode as arrows, never
         // as a bare Esc plus a stray letter. Also: a split SS3 must wait, not
         // mis-fire.
         var pSS3 = new InputPump();
-        var rSS3 = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var rSS3 = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         pSS3.buf = "\x1bOA\x1bOB\x1bOC\x1bOD";
         pSS3.drain(rSS3, true);
         if (rSS3.arrows.join(",") !== "up,down,right,left")
@@ -4328,7 +4531,7 @@ var FLPlayer;
         if (rSS3.esc || rSS3.keys.length)
             throw new Error("SS3 arrows leaked esc/keys");
         var pSS3s = new InputPump();
-        var rSS3s = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var rSS3s = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         pSS3s.buf = "\x1bO";
         pSS3s.drain(rSS3s, true);
         if (rSS3s.esc || rSS3s.arrows.length)
@@ -4341,7 +4544,7 @@ var FLPlayer;
         // the pump must surface those as arrows. KEY_DOWN (\x0a) must NOT read as
         // Enter -- that made the song list's Down arrow play the track.
         var pNav = new InputPump();
-        var rNav = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var rNav = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         pNav.buf = "\x1e\x0a\x1d\x06\x10\x0e\x02\x05";
         pNav.drain(rNav, true);
         if (rNav.arrows.join(",") !== "up,down,left,right,pgup,pgdn,home,end")
@@ -4351,7 +4554,7 @@ var FLPlayer;
         // The killer case: an audio notify split right after its ESC byte
         // must NOT become Esc + plain chars (the phantom 'N' bug).
         var pSplit = new InputPump();
-        var rSplit = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var rSplit = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         pSplit.buf = "\x1b";
         pSplit.drain(rSplit, true); // pump boundary hits mid-sequence
         pSplit.buf += "[=7;2;0n"; // the rest arrives next pump
@@ -4363,7 +4566,7 @@ var FLPlayer;
         if (rSplit.audio.length !== 1 || rSplit.audio[0][0] !== 2 || rSplit.audio[0][1] !== 0)
             throw new Error("split notify not reassembled");
         var p3 = new InputPump();
-        var r3 = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var r3 = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         p3.buf = "\x1b[74;162R";
         p3.drain(r3, true);
         if (r3.cpr.length !== 1 || r3.cpr[0][0] !== 74 || r3.cpr[0][1] !== 162)
@@ -4381,7 +4584,7 @@ var FLPlayer;
         // the ESC; the bare tail must become an audio event, NOT keys ending
         // in a phantom 'N'.
         var pOrf = new InputPump();
-        var rOrf = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var rOrf = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         pOrf.buf = "[=7;2;0n";
         pOrf.drain(rOrf, true);
         if (rOrf.keys.length)
@@ -4389,13 +4592,13 @@ var FLPlayer;
         if (rOrf.audio.length !== 1 || rOrf.audio[0][0] !== 2 || rOrf.audio[0][1] !== 0)
             throw new Error("orphan tail not recovered as audio");
         // Orphaned CPR tail likewise.
-        var rOrf2 = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var rOrf2 = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         pOrf.buf = "[74;162R";
         pOrf.drain(rOrf2, true);
         if (rOrf2.keys.length || rOrf2.cpr.length !== 1 || rOrf2.cpr[0][0] !== 74)
             throw new Error("orphan CPR not recovered");
         // A real '[' keystroke still gets through once aged.
-        var rOrf3 = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var rOrf3 = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         pOrf.buf = "[";
         pOrf.bracketAt = nowMs() - 300;
         pOrf.drain(rOrf3, true);
@@ -4403,7 +4606,7 @@ var FLPlayer;
             throw new Error("aged bracket keystroke lost");
         // Split CSI across feeds must not produce phantom keys.
         var p2 = new InputPump();
-        var r2 = { keys: [], arrows: [], esc: false, audio: [], cpr: [], other: [] };
+        var r2 = { keys: [], arrows: [], esc: false, audio: [], cpr: [], apc: [], other: [] };
         p2.buf = "\x1b[=7;2";
         p2.drain(r2, false);
         if (r2.keys.length || r2.audio.length || r2.esc)
@@ -4465,10 +4668,15 @@ var FLPlayer;
         writeln("FLPlayer self-test: OK");
         // Optional end-to-end leg: --selftest <mp3path> exercises the real
         // ffmpeg transcode + header parse + slicing on an actual track.
+        // Adding --3ds applies the 3dBBS handheld profile first, so the
+        // reported chunkB64 is the size that terminal will actually receive
+        // (a sysop can compare the two runs without a 3DS in hand).
         var mp3 = "";
         if (typeof argv !== "undefined" && argv) {
             for (var ai = 0; ai < argv.length; ai++) {
-                if (argv[ai] !== "--selftest" && file_exists(argv[ai]))
+                if (argv[ai] === "--3ds")
+                    apply3dbbsProfile();
+                else if (argv[ai] !== "--selftest" && file_exists(argv[ai]))
                     mp3 = argv[ai];
             }
         }
@@ -4505,7 +4713,7 @@ var FLPlayer;
             tf.close();
             if (!slice || slice.length !== chunkB)
                 throw new Error("slice read failed");
-            var feats = chunkFeatures(slice, inf.channels);
+            var feats = chunkFeatures(slice, inf.channels, inf.rate);
             var b64len = base64_encode(wavHeader(slice.length, inf.rate, inf.channels) + slice).length;
             writeln(format("FLPlayer transcode test: OK  rate=%d ch=%d duration=%ds chunks=%d chunkB64=%d rms=%s zcr=%s", inf.rate, inf.channels, Math.round(inf.dataBytes / bps), Math.ceil(inf.dataBytes / chunkB), b64len, feats.rms.toFixed(2), feats.zcr.toFixed(2)));
         }
@@ -4544,6 +4752,11 @@ var FLPlayer;
         load("json-db.js");
     }
     catch (_) { } // per-user playlist storage
+    // Shared play-count store (same file the web radio counts into).
+    try {
+        load(system.mods_dir + "load/fl_playcounts.js");
+    }
+    catch (_) { }
     function createDefaultFilters() {
         return {
             search: "",
@@ -5185,7 +5398,189 @@ var FLPlayer;
     function loadCatalog(forceRefresh) {
         var tracks = loadCatalogInner(forceRefresh);
         applyTrackOverrides(tracks);
+        applyPlayCounts(tracks);
         return tracks;
+    }
+    // ---- play counts (shared with the web radio) -------------------------
+    function playCountsAvailable() {
+        return typeof FLPlayCounts !== "undefined" && !!FLPlayCounts;
+    }
+    // Stamp every catalog entry with its current play count.
+    function applyPlayCounts(tracks) {
+        var counts = {};
+        if (!playCountsAvailable())
+            return;
+        try {
+            counts = FLPlayCounts.counts() || {};
+        }
+        catch (_) {
+            return;
+        }
+        for (var i = 0; i < tracks.length; i += 1) {
+            var entry = counts[lower(tracks[i].name)];
+            tracks[i].plays = entry ? (entry.plays || 0) : 0;
+            tracks[i].lastPlayed = entry ? (entry.last_played || 0) : 0;
+        }
+    }
+    // After the player returns: count the play if the listener heard enough
+    // of it (the store applies the 30-second rule and per-user throttle).
+    function recordTerminalPlay(track) {
+        if (!playCountsAvailable() || !track)
+            return;
+        try {
+            var result = FLPlayCounts.record(track.name, {
+                source: "door",
+                user: user && user.number ? user.number : 0,
+                listened: FLPlayer.lastPlayMs / 1000,
+                duration: FLPlayer.lastTotalSec
+            });
+            if (result && result.counted) {
+                track.plays = result.plays;
+                track.lastPlayed = result.last_played;
+            }
+        }
+        catch (err) {
+            log(LOG_WARNING, "fl_records: play count failed: " + err);
+        }
+    }
+    // Catalog entries ranked by play count (most played first).
+    function topPlayedTracks(app, limit) {
+        var byName = {};
+        var out = [];
+        if (!playCountsAvailable())
+            return out;
+        applyPlayCounts(app.catalog); // fresh numbers (the web may have counted since launch)
+        for (var i = 0; i < app.catalog.length; i += 1)
+            byName[lower(app.catalog[i].name)] = app.catalog[i];
+        var ranked = [];
+        try {
+            ranked = FLPlayCounts.top(0) || [];
+        }
+        catch (_) {
+            ranked = [];
+        }
+        for (var r = 0; r < ranked.length && out.length < limit; r += 1) {
+            var hit = byName[lower(ranked[r].name)];
+            if (hit)
+                out.push(hit);
+        }
+        return out;
+    }
+    // "Top Played" chart: lightbar list, ENTER/SPACE plays the highlighted
+    // song with the chart (in rank order) as the queue, ESC backs out.
+    function topPlayedScreen(app) {
+        var result = null;
+        var ranked = topPlayedTracks(app, 100);
+        withConsoleScreen(function () {
+            var sel = 0;
+            var top = 0;
+            var lastCols = 0;
+            var lastRows = 0;
+            var full = true;
+            var dirty = true;
+            var done = false;
+            if (!ranked.length) {
+                console.clear();
+                printConsoleHeader("Top Played");
+                console.writeln("");
+                console.writeln("  No plays counted yet. A play counts after 30 seconds of");
+                console.writeln("  listening, here in the terminal or on the web radio.");
+                console.writeln("");
+                waitForAnyKey();
+                return;
+            }
+            while (!done && bbs.online && !js.terminated) {
+                var cols = Math.max(40, console.screen_columns || 80);
+                var rows = Math.max(10, console.screen_rows || 24);
+                if (cols !== lastCols || rows !== lastRows) {
+                    full = true;
+                    lastCols = cols;
+                    lastRows = rows;
+                }
+                var listTop = 4;
+                var listH = Math.max(1, rows - listTop);
+                if (sel < top)
+                    top = sel;
+                if (sel >= top + listH)
+                    top = sel - listH + 1;
+                if (top < 0)
+                    top = 0;
+                if (full) {
+                    console.write("\x1b[?25l\x1b[2J");
+                    full = false;
+                    dirty = true;
+                }
+                if (dirty) {
+                    console.write(csiAt(1, 1) + csiSgr("0;1;33") +
+                        padClip(" FUTURELAND RECORDS  --  Top Played", cols) + CSI_RESET);
+                    var count = " " + ranked.length + " charted ";
+                    var widths = topPlayedWidths(cols);
+                    console.write(csiAt(2, 1) + csiSgr("0;1;37") +
+                        padClip("   #  PLAYS  " + padRight("TITLE", widths.titleW) + "  ARTIST", Math.max(0, cols - count.length)) +
+                        csiSgr("0;1;33") + count + CSI_RESET);
+                    console.write(csiAt(3, 1) + csiSgr("0;30;43") +
+                        padClip("  ENTER/SPACE play from here   ESC back  ", cols) + CSI_RESET);
+                    for (var r = 0; r < listH; r += 1) {
+                        var idx = top + r;
+                        var y = listTop + r;
+                        var w = (y >= rows) ? cols - 1 : cols; // never write the bottom-right cell
+                        var txt = idx < ranked.length ? topPlayedRow(ranked[idx], idx + 1, cols) : "";
+                        var on = idx === sel;
+                        console.write(csiAt(y, 1) + csiSgr(on ? "0;30;43" : "0;37") + padClip(txt, w) + CSI_RESET);
+                    }
+                    dirty = false;
+                }
+                var k = FLPlayer.readKey(120);
+                if (k.length) {
+                    dirty = true;
+                    if (k === "\x1b") {
+                        done = true;
+                    }
+                    else if (k === "\r" || k === " ") {
+                        result = { list: ranked.slice(), index: sel };
+                        done = true;
+                    }
+                    else if (k === "\x1e") { // up
+                        sel = sel > 0 ? sel - 1 : ranked.length - 1;
+                    }
+                    else if (k === "\x0a") { // down
+                        sel = (sel + 1) % ranked.length;
+                    }
+                    else if (k === "\x10" || k === "\x1d") { // page up / left
+                        sel = Math.max(0, sel - listH);
+                    }
+                    else if (k === "\x0e" || k === "\x06") { // page down / right
+                        sel = Math.min(ranked.length - 1, sel + listH);
+                    }
+                    else if (k === "\x02") { // home
+                        sel = 0;
+                    }
+                    else if (k === "\x05") { // end
+                        sel = ranked.length - 1;
+                    }
+                }
+            }
+            console.write("\x1b[?25h" + CSI_RESET);
+        });
+        return result;
+    }
+    // Column widths for the chart: " ### PPPPP  TITLE...  ARTIST" (13 fixed cols).
+    function topPlayedWidths(cols) {
+        var artistW = Math.max(12, Math.min(30, cols - 52));
+        var titleW = Math.max(20, cols - 13 - artistW - 2);
+        return { titleW: titleW, artistW: artistW };
+    }
+    function topPlayedRow(track, rank, cols) {
+        var rankTxt = String(rank);
+        while (rankTxt.length < 3)
+            rankTxt = " " + rankTxt;
+        var playsTxt = String(track.plays || 0);
+        while (playsTxt.length < 5)
+            playsTxt = " " + playsTxt;
+        var widths = topPlayedWidths(cols);
+        var title = truncateText(toScreenText(displayTrackTitle(track)), widths.titleW);
+        var artist = truncateText(toScreenText(displayTrackArtist(track)), widths.artistW);
+        return " " + rankTxt + "  " + playsTxt + "  " + padRight(title, widths.titleW) + "  " + artist;
     }
     function loadCatalogInner(forceRefresh) {
         var base = new FileBase(DIR_CODE);
@@ -5550,6 +5945,7 @@ var FLPlayer;
         lines.push("Size: " + track.size + " bytes");
         lines.push("Modified: " + (track.mtime ? system.datestr(track.mtime) : "-"));
         lines.push("Added: " + (track.added ? system.datestr(track.added) : "-"));
+        lines.push("Plays: " + (track.plays || 0) + (track.lastPlayed ? " (last " + system.datestr(track.lastPlayed) + ")" : ""));
         lines.push("Description: " + toScreenText(track.description || "-"));
         lines.push("Embedded ANSI art: " + (parsed.ansiArtBase64.length ? "Yes" : "No"));
         lines.push("Embedded lyrics: " + ((parsed.lyricsText.length || parsed.syncedLyrics.length) ? "Yes" : "No"));
@@ -5607,7 +6003,7 @@ var FLPlayer;
             includeLyrics: true,
             includeAnsiArt: false
         });
-        var lyrics = trimValue(parsed.lyricsText || loadSidecarLyrics(track));
+        var lyrics = trimValue(loadSidecarLyrics(track) || parsed.lyricsText);
         if (!lyrics.length) {
             console.clear();
             printConsoleHeader(displayTrackTitle(track) + " Lyrics");
@@ -5826,7 +6222,11 @@ var FLPlayer;
                 waitForAnyKey();
                 return;
             }
-            console.writeln("Audio sink: " + (sink === "syncterm" ? "SyncTERM (libsndfile)" : "APC bridge"));
+            // Naming the handheld here is the only visible confirmation that
+            // the low-bandwidth profile engaged — the symptom it fixes (audio
+            // chop) is otherwise indistinguishable from a slow link.
+            console.writeln("Audio sink: " + (FLPlayer.is3dbbs() ? "3dBBS (low-bandwidth)"
+                : sink === "syncterm" ? "SyncTERM (libsndfile)" : "APC bridge"));
             var curList = (list && list.length) ? list : [track];
             var idx = typeof index === "number" ? Math.max(0, Math.min(index, curList.length - 1)) : 0;
             var currentPlaylist = playlistName || ""; // set when the queue is a playlist (enables [R]emove)
@@ -5851,10 +6251,12 @@ var FLPlayer;
                     includeLyrics: true,
                     includeAnsiArt: true
                 });
-                // Timed lyrics: embedded SYLT first, then a timestamped .lrc
-                // sidecar; untimed text distributes evenly over the duration.
-                var timed = [];
-                if (parsed.syncedLyrics && parsed.syncedLyrics.length) {
+                // Timed lyrics: a timestamped .lrc sidecar first (the web
+                // editor saves corrections there, and the web prefers it too),
+                // then embedded SYLT; untimed text distributes evenly over
+                // the duration.
+                var timed = loadSidecarSyncedLyrics(cur);
+                if (!timed.length && parsed.syncedLyrics && parsed.syncedLyrics.length) {
                     for (var si = 0; si < parsed.syncedLyrics.length; si++) {
                         timed.push({
                             time: parsed.syncedLyrics[si].time,
@@ -5862,11 +6264,8 @@ var FLPlayer;
                         });
                     }
                 }
-                else {
-                    timed = loadSidecarSyncedLyrics(cur);
-                }
                 var flat = timed.length ? "" :
-                    toScreenText(trimValue(parsed.lyricsText || loadSidecarLyrics(cur)));
+                    toScreenText(trimValue(loadSidecarLyrics(cur) || parsed.lyricsText));
                 var residentAvatars = trackAvatars(cur);
                 var playable = {
                     path: cur.path,
@@ -5887,6 +6286,8 @@ var FLPlayer;
                     queueLen: curList.length
                 };
                 var outcome = FLPlayer.playTrack(playable);
+                if (outcome !== "error")
+                    recordTerminalPlay(cur);
                 // Honor whatever was pressed while the player was tearing
                 // down / the next track was loading: Q still quits, and
                 // buffered N/P adjust how far we move — no more sailing past
@@ -5928,6 +6329,23 @@ var FLPlayer;
                 }
                 if (outcome === "addplaylist") {
                     addToPlaylistFlow(curList[idx].name, displayTrackTitle(curList[idx]));
+                    console.clear();
+                    continue;
+                }
+                if (outcome === "top") {
+                    // Most-played chart: picking plays the chart in rank order
+                    // (no shuffle); backing out resumes the current queue.
+                    var chart = topPlayedScreen(activeApp);
+                    if (chart && chart.list.length) {
+                        curList = chart.list;
+                        idx = Math.max(0, Math.min(chart.index, curList.length - 1));
+                        currentPlaylist = "";
+                        FLPlayer.shuffle = false;
+                        history = [];
+                        seedBag(bag, curList.length, idx);
+                        passPos = 1;
+                        FLPlayer.shuffleReset = false; // fresh queue
+                    }
                     console.clear();
                     continue;
                 }
@@ -7424,6 +7842,58 @@ var FLPlayer;
             throw new Error("delete failed");
         writeln("playlist self-test: OK");
     }
+    // Play counting through the shared store, against a scratch file so the
+    // live chart is untouched: the 30s rule, the per-user throttle, and the
+    // catalog stamping that feeds the Top Played chart.
+    function playCountSelfTest() {
+        if (!playCountsAvailable()) {
+            writeln("play-count self-test: SKIP (fl_playcounts.js not loaded)");
+            return;
+        }
+        var livePath = FLPlayCounts.path;
+        var testPath = pathJoin(dataDirPath(), "__fltest-playcounts__.json");
+        FLPlayCounts.configure({ path: testPath });
+        try {
+            if (file_exists(testPath))
+                file_remove(testPath);
+            var r = FLPlayCounts.record("Test_Song.mp3", { source: "door", user: 1, listened: 12, duration: 180 });
+            if (r.counted)
+                throw new Error("12s of 180s counted as a play");
+            r = FLPlayCounts.record("Test_Song.mp3", { source: "door", user: 1, listened: 31, duration: 180 });
+            if (!r.counted || r.plays !== 1)
+                throw new Error("31s not counted: " + JSON.stringify(r));
+            r = FLPlayCounts.record("test_song.mp3", { source: "door", user: 1, listened: 31, duration: 180 });
+            if (r.counted || r.reason !== "throttled")
+                throw new Error("repeat within 30s not throttled: " + JSON.stringify(r));
+            r = FLPlayCounts.record("test_song.mp3", { source: "web", user: 2, listened: 31, duration: 180 });
+            if (!r.counted || r.plays !== 2)
+                throw new Error("second user not counted: " + JSON.stringify(r));
+            r = FLPlayCounts.record("Short.mp3", { source: "door", user: 1, listened: 9, duration: 10 });
+            if (!r.counted)
+                throw new Error("90% of a 10s track should count");
+            var fake = createAppState();
+            fake.catalog = [
+                buildSummary({ name: "Short.mp3" }, "/x/Short.mp3", 1, 0, emptyParsedTags()),
+                buildSummary({ name: "Test_Song.mp3" }, "/x/Test_Song.mp3", 1, 0, emptyParsedTags()),
+                buildSummary({ name: "Never.mp3" }, "/x/Never.mp3", 1, 0, emptyParsedTags())
+            ];
+            var ranked = topPlayedTracks(fake, 10);
+            if (ranked.length !== 2)
+                throw new Error("chart length " + ranked.length);
+            if (ranked[0].name !== "Test_Song.mp3" || ranked[0].plays !== 2)
+                throw new Error("chart order: " + ranked[0].name);
+            if (fake.catalog[2].plays !== 0)
+                throw new Error("unplayed track should stamp 0");
+            if (topPlayedRow(ranked[0], 1, 80).indexOf("   1      2  Test_Song") !== 0)
+                throw new Error("row format: " + topPlayedRow(ranked[0], 1, 80));
+            writeln("play-count self-test: OK");
+        }
+        finally {
+            if (file_exists(testPath))
+                file_remove(testPath);
+            FLPlayCounts.configure({ path: livePath });
+        }
+    }
     // No-repeat shuffle: every queue track must play before any repeats, and a
     // track never lands twice in a row.
     function shuffleSelfTest() {
@@ -7513,6 +7983,7 @@ var FLPlayer;
         if (typeof argv !== "undefined" && argv && argv.indexOf("--selftest") >= 0) {
             sanitizerSelfTest();
             playlistSelfTest();
+            playCountSelfTest();
             shuffleSelfTest();
             FLPlayer.selfTest();
             return;
