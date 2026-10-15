@@ -1570,11 +1570,10 @@ interface AppState {
                 waitForAnyKey();
                 return;
             }
-            // Naming the handheld here is the only visible confirmation that
-            // the low-bandwidth profile engaged — the symptom it fixes (audio
-            // chop) is otherwise indistinguishable from a slow link.
-            console.writeln("Audio sink: " + (FLPlayer.is3dbbs() ? "3dBBS (low-bandwidth)"
-                : sink === "syncterm" ? "SyncTERM (libsndfile)" : "APC bridge"));
+            // The tier line is the visible confirmation of what the measured
+            // link bought -- chop on a low tier reads as "slow link", not a bug.
+            console.writeln("Audio sink: " + (sink === "syncterm" ? "SyncTERM (libsndfile)" : "APC bridge")
+                + ", " + FLPlayer.audioTierLabel());
 
             var curList = (list && list.length) ? list : [track];
             var idx = typeof index === "number" ? Math.max(0, Math.min(index, curList.length - 1)) : 0;

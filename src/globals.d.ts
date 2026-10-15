@@ -210,3 +210,4 @@ declare var USER_ANSI: number;
 declare var USER_UTF8: number;
 declare var MSG_DELETE: number;
 declare var LOG_WARNING: number;
+declare var LOG_INFO: number;

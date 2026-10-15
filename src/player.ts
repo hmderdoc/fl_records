@@ -51,10 +51,10 @@ namespace FLPlayer {
     load("sbbsdefs.js");
 
     // ---- tuning -------------------------------------------------------
-    // These are the DESKTOP profile (SyncTERM/BBSproxy on a real computer).
-    // They are `var`, not const, because detectSink() re-points them at the
-    // low-bandwidth profile when the caller turns out to be a 3dBBS handheld
-    // — see apply3dbbsProfile() for why that terminal needs its own set.
+    // PCM_RATE / PCM_CHANNELS / UI_TICK_MS start at the top audio tier and are
+    // `var`, not const: measureLink() re-points them at the tier the caller's
+    // MEASURED link can carry, and playback steps further down when the
+    // terminal falls behind — see "audio tiers" below.
     var CHUNK_MS = 300;          // clip length; also the pacing quantum
     var PREBUFFER = 3;           // chunks queued ahead of realtime
     var CHANNEL = 2;             // first APC-dedicated channel (0/1 are cterm's)
@@ -580,6 +580,10 @@ namespace FLPlayer {
      *
      * The transcode cache key already includes rate x channels, so the two
      * profiles coexist on disk rather than invalidating each other.
+     *
+     * Since then the bandwidth half of this is MEASURED for every terminal
+     * (see "audio tiers"): the 8 KB-per-round-trip intake shows up in the
+     * link reading. Only the mono cap below still keys on the 3DS identity.
      */
     var CTERM_3DBBS = 1332;      // CTerm version 3dBBS reports (matches scene3d.js)
     var QUERY_3DS = "\x1b_3DS:Query\x1b\\";
@@ -606,13 +610,153 @@ namespace FLPlayer {
         }
     }
 
-    /** Re-point the streaming/UI tuning at the handheld's intake budget. */
+    /**
+     * 3dBBS plays mono at handheld rates whatever it is sent, so tiers above
+     * mono 11 kHz are pure waste there. This is the only thing the 3DS
+     * identity still decides; how much it can RECEIVE is measured like any
+     * other terminal's (its 8 KB receive window shows up in the reading).
+     */
     function apply3dbbsProfile(): void {
-        PCM_CHANNELS = 1;        // client downmixes to mono regardless
-        PCM_RATE = 11025;        // 4x less wire traffic together with mono
-        UI_TICK_MS = 220;        // leave parse budget for the audio stream
-        dbg("3dBBS profile: " + PCM_RATE + "Hz x" + PCM_CHANNELS +
-            " ui=" + UI_TICK_MS + "ms");
+        tierCap = MONO_TIER;
+        if (tierIndex < tierCap)
+            applyTier(tierCap, "3dBBS plays mono");
+    }
+
+    // ---- audio tiers ----------------------------------------------------------
+    /**
+     * The stream format follows the caller's MEASURED link speed, not what
+     * terminal it is: a slow desktop SyncTERM chopped on the full stereo
+     * stream, while a 3DS on a near board could carry more than it was given.
+     *
+     * Wire cost is PCM x 4/3 (base64) plus ~3% APC/WAV framing per chunk. A
+     * tier is chosen when it fits in LINK_HEADROOM of the measured rate; the
+     * rest is left for the art wipes and visualizer, which share the link.
+     */
+    interface AudioTier { name: string; rate: number; channels: number; uiTickMs: number; }
+    var AUDIO_TIERS: AudioTier[] = [
+        { name: "stereo 22 kHz", rate: 22050, channels: 2, uiTickMs: 150 },  // ~121 KB/s on the wire
+        { name: "mono 11 kHz", rate: 11025, channels: 1, uiTickMs: 220 },    // ~30 KB/s
+        { name: "mono 8 kHz", rate: 8000, channels: 1, uiTickMs: 330 },      // ~22 KB/s; slower visuals free the link
+    ];
+    var MONO_TIER = 1;
+    var LINK_HEADROOM = 0.75;
+    var tierIndex = 0;
+    var tierCap = 0;             // best tier allowed (3dBBS: mono)
+    var linkKbps: number | null = null;   // session reading, KB/s (= bytes/ms)
+    var linkSource = "";
+    var linkMeasured = false;
+
+    export function tierWireKbps(t: AudioTier): number {
+        return t.rate * t.channels * 2 * 4 / 3 * 1.03 / 1000;
+    }
+
+    /** Best tier at or below the cap whose wire rate fits the measured link. */
+    export function tierForKbps(kbps: number): number {
+        for (var i = tierCap; i < AUDIO_TIERS.length; i++) {
+            if (tierWireKbps(AUDIO_TIERS[i]) <= kbps * LINK_HEADROOM)
+                return i;
+        }
+        return AUDIO_TIERS.length - 1;
+    }
+
+    function applyTier(index: number, why: string): void {
+        tierIndex = Math.max(0, Math.min(AUDIO_TIERS.length - 1, index));
+        var t = AUDIO_TIERS[tierIndex];
+        PCM_RATE = t.rate;
+        PCM_CHANNELS = t.channels;
+        UI_TICK_MS = t.uiTickMs;
+        try { log(LOG_INFO, "fl_records audio tier: " + t.name + " (" + why + ")"); } catch (e) { }
+        dbg("audio tier " + t.name + " (" + why + ")");
+    }
+
+    /** Human description for the sink line, e.g. "mono 11 kHz for ~44 KB/s". */
+    export function audioTierLabel(): string {
+        var t = AUDIO_TIERS[tierIndex];
+        return t.name + (linkKbps !== null ? " for ~" + Math.round(linkKbps) + " KB/s link" : "");
+    }
+
+    /** One cursor round trip in ms (the core blocks until the reply, 5 s max). */
+    function roundTripMs(): number | null {
+        var started = nowMs();
+        var pos: any = null;
+        try { pos = console.getxy(); } catch (e) { pos = null; }
+        return pos ? nowMs() - started : null;
+    }
+
+    var USER_ANSI_FLAG = 1 << 1;   // userdefs.js USER_ANSI
+    var GETXY_TIMEOUT_MS = 5000;
+    var PROBE_FILL = "\x1b[s\x1b[u";   // save/restore cursor: harmless, nothing drawn
+
+    /**
+     * Time the terminal taking in a known burst: bare round trip, then the
+     * same after `bytes` of no-op filler. The terminal can only answer once it
+     * has processed everything queued ahead of the query, so the difference is
+     * drain time. A small burst first, so a modem-speed caller only waits on
+     * ~4 KB; a bigger one when the small one drained too fast to judge.
+     */
+    function probeLinkKbps(): number | null {
+        try { if (!(console.autoterm & USER_ANSI_FLAG)) return null; } catch (e) { return null; }
+        // The first round trip waits out whatever is still queued (catalog
+        // screens on a slow link); only the second is the bare latency. The
+        // terminal answered ANSI queries at connect, so running out the 5 s
+        // timeout here means a backlog that deep: a slow link, not silence.
+        if (roundTripMs() === null)
+            return 1;
+        var rtt = roundTripMs();
+        if (rtt === null)
+            return null;
+        var sizes = [4096, 16384];
+        var kbps: number | null = null;
+        for (var i = 0; i < sizes.length; i++) {
+            var fill = "";
+            while (fill.length < sizes[i])
+                fill += PROBE_FILL;
+            console.write(fill);
+            var t = roundTripMs();
+            if (t === null)
+                return fill.length / GETXY_TIMEOUT_MS;        // slower than this
+            var drain = t - rtt;
+            kbps = fill.length / Math.max(40, drain);          // under 40 ms is jitter
+            if (drain >= 400)
+                break;                                         // long enough to trust
+        }
+        return kbps;
+    }
+
+    /**
+     * Once per session, before the first transcode: pick the audio tier from
+     * the link reading. The shell leaves its own first-paint reading in
+     * bbs.mods when it launched us; otherwise probe. No reading = top tier.
+     */
+    export function measureLink(): void {
+        if (linkMeasured)
+            return;
+        linkMeasured = true;
+        try {
+            var shell: any = bbs.mods && bbs.mods["fshell_link_reading"];
+            if (shell && shell.kind === "measured" && typeof shell.kbps === "number") {
+                linkKbps = shell.kbps;
+                linkSource = "shell first paint";
+            }
+        } catch (e) { }
+        if (linkKbps === null) {
+            linkKbps = probeLinkKbps();
+            linkSource = "probe";
+        }
+        if (linkKbps === null) {
+            applyTier(tierCap, "link not measurable");
+            return;
+        }
+        applyTier(Math.max(tierCap, tierForKbps(linkKbps)),
+            "~" + linkKbps.toFixed(1) + " KB/s from " + linkSource);
+    }
+
+    /** Step down one tier mid-session; false when already at the bottom. */
+    function stepDownTier(why: string): boolean {
+        if (tierIndex >= AUDIO_TIERS.length - 1)
+            return false;
+        applyTier(tierIndex + 1, why);
+        return true;
     }
 
     // ---- sink detection ---------------------------------------------------
@@ -696,6 +840,8 @@ namespace FLPlayer {
         }
 
         detectedSink = found;
+        if (found !== "none")
+            measureLink();
         return found;
     }
 
@@ -2262,30 +2408,47 @@ namespace FLPlayer {
             return "error";
         }
         say("Preparing audio (transcoding)...");
-        var wavPath = ensureTranscoded(track);
-        if (wavPath === null) {
-            say("Transcode failed for " + track.name);
-            mswait(1800);
-            return "error";
-        }
-
-        var f = new File(wavPath);
-        if (!f.open("rb"))
-            return "error";
-        try {
-            var info = readWavInfo(f);
-            if (!info || !info.dataBytes) {
-                say("Bad PCM cache file.");
-                mswait(1500);
+        var startMs = 0;
+        // A "retier" exit means the link fell behind mid-song: the tier has
+        // already stepped down, so transcode at the new format and carry on
+        // from where the listener was.
+        while (true) {
+            var wavPath = ensureTranscoded(track);
+            if (wavPath === null) {
+                say("Transcode failed for " + track.name);
+                mswait(1800);
                 return "error";
             }
-            return playLoop(track, f, info);
-        } finally {
-            f.close();
+
+            var f = new File(wavPath);
+            if (!f.open("rb"))
+                return "error";
+            var outcome: PlayResult | "retier";
+            try {
+                var info = readWavInfo(f);
+                if (!info || !info.dataBytes) {
+                    say("Bad PCM cache file.");
+                    mswait(1500);
+                    return "error";
+                }
+                outcome = playLoop(track, f, info, startMs);
+            } finally {
+                f.close();
+            }
+            if (outcome !== "retier")
+                return outcome;
+            startMs = lastPlayMs;
+            say("Your connection is falling behind; switching to " + AUDIO_TIERS[tierIndex].name + "...");
         }
     }
 
-    function playLoop(track: PlayableTrack, f: File, info: WavInfo): PlayResult {
+    // Mid-song link check: a cursor round trip every LAG_CHECK_MS. Lag past
+    // the prebuffer cushion means the terminal is behind what it is hearing.
+    var LAG_CHECK_MS = 3000;
+    var LAG_BEHIND_MS = 1000;
+    var UNDERRUN_WINDOW_MS = 20000;
+
+    function playLoop(track: PlayableTrack, f: File, info: WavInfo, startMs: number): PlayResult | "retier" {
         var bytesPerSec = info.rate * info.channels * 2;
         var chunkBytes = Math.floor(bytesPerSec * CHUNK_MS / 1000);
         // Frame-align so a chunk never splits a sample frame.
@@ -2494,7 +2657,11 @@ namespace FLPlayer {
         var FLUSH_GRACE_MS = 1500;
         var lastFlushAt = nowMs();
         var lastUiAt = 0;
-        var result: PlayResult = "ended";
+        var result: PlayResult | "retier" = "ended";
+        var lastLagCheckAt = nowMs();
+        var behindCount = 0;
+        var lastLag = -1;
+        var underrunAt: number[] = [];
         var features: { rms: number; raw: number; zcr: number; lo: number; mid: number; hi: number } =
             { rms: 0, raw: 0, zcr: 0, lo: 0, mid: 0, hi: 0 };
         var featForChunk: { rms: number; raw: number; zcr: number; lo: number; mid: number; hi: number }[] = [];
@@ -2524,7 +2691,10 @@ namespace FLPlayer {
             apc("A;Update;C=" + CHANNEL);
         }
 
-        dbg("playLoop start: " + track.name + " chunks=" + totalChunks);
+        if (startMs > 0)
+            rePrime(Math.floor(startMs / CHUNK_MS));
+
+        dbg("playLoop start: " + track.name + " chunks=" + totalChunks + " at " + startMs + "ms");
         console.write("\x1b[?25l");   // hide the cursor for the show
         while (bbs.online && !js.terminated) {
             var now = nowMs();
@@ -2625,9 +2795,38 @@ namespace FLPlayer {
                         // Re-anchor and re-prime, exactly like lameboy does.
                         dbg("notify: underrun re-prime @" + playChunk);
                         rePrime(playChunk);
+                        underrunAt.push(now);
+                        while (underrunAt.length && now - underrunAt[0] > UNDERRUN_WINDOW_MS)
+                            underrunAt.shift();
+                        if (underrunAt.length >= 2 && stepDownTier(underrunAt.length + " underruns in "
+                                + (UNDERRUN_WINDOW_MS / 1000) + "s")) {
+                            result = "retier";
+                            quitReq = true;
+                        }
                     }
                 }
             }
+            // Is the terminal keeping up? Skipped right after a Flush (the
+            // re-prime burst is expected to queue) and while paused.
+            if (!quitReq && !paused && chunk < totalChunks &&
+                    now - lastLagCheckAt >= LAG_CHECK_MS && now - lastFlushAt >= 3000) {
+                lastLagCheckAt = now;
+                var lag = roundTripMs();
+                // Behind = past the cushion AND not shrinking: a lag that is
+                // falling is a backlog draining (e.g. right after a step down),
+                // which the current tier is already keeping up with.
+                var falling = lag !== null && lastLag >= 0 && lag < lastLag;
+                behindCount = (lag === null || (lag > LAG_BEHIND_MS && !falling)) ? behindCount + 1 : 0;
+                lastLag = lag === null ? GETXY_TIMEOUT_MS : lag;
+                dbg("lag check: " + (lag === null ? "no reply" : lag + "ms") + " behind=" + behindCount);
+                if (behindCount >= 2 && stepDownTier("terminal " + (lag === null ? "stopped answering" : lag + " ms behind"))) {
+                    result = "retier";
+                    quitReq = true;
+                }
+                now = nowMs();
+                playMs = paused ? pausedMs : (now - t0);
+            }
+
             if (quitReq)
                 break;
 
@@ -3409,6 +3608,17 @@ namespace FLPlayer {
             if (sr.y + sr.h - 1 >= fakeL.rows && sr.x + sr.w - 1 >= fakeL.cols)
                 throw new Error("margin rect covers the bottom-right cell (scroll bug)");
         }
+
+        // Audio tiers follow the measured link: 3DS at 180 ms (~45 KB/s) gets
+        // mono 11 kHz, broadband stereo, a weak link the 8 kHz floor.
+        if (tierForKbps(400) !== 0) throw new Error("400 KB/s should get stereo");
+        if (tierForKbps(45) !== 1) throw new Error("45 KB/s should get mono 11 kHz");
+        if (tierForKbps(25) !== 2) throw new Error("25 KB/s should get mono 8 kHz");
+        if (tierForKbps(2) !== AUDIO_TIERS.length - 1) throw new Error("tiny links get the floor");
+        var savedCap = tierCap;
+        tierCap = MONO_TIER;
+        if (tierForKbps(400) !== MONO_TIER) throw new Error("mono cap ignored");
+        tierCap = savedCap;
 
         writeln("FLPlayer self-test: OK");
 
